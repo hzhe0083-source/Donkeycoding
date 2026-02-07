@@ -1,0 +1,5 @@
+target/
+target_tmp_verify/
+node_modules/
+packages/vscode-ext/out/
+tmp_*.txt

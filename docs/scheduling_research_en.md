@@ -430,3 +430,134 @@ Implementation notes: adapter-aware paging reduces fragmentation.
 - Locality-Aware Fair Scheduling: https://arxiv.org/abs/2501.14312
 - SpotServe: https://arxiv.org/abs/2311.15566
 
+## 10. Newly reviewed papers (batch 4)
+### 10.1 Splitwise (arXiv 2311.18677)
+Scheduling focus: phase splitting between prompt computation and token generation.
+Key ideas:
+- Separates prefill (compute-heavy) and decode (memory-heavy) across different machines.
+- Optimizes cross-phase state transfer over high-speed interconnect.
+System takeaways: phase-aware hardware matching can improve throughput and cost-efficiency.
+
+### 10.2 Inference without Interference (arXiv 2401.11181)
+Scheduling focus: disaggregated serving for mixed workloads.
+Key ideas:
+- Decouples serving stages to reduce workload interference.
+- Improves isolation across heterogeneous request types.
+System takeaways: disaggregation improves multi-workload stability in production serving.
+
+### 10.3 Mooncake (arXiv 2407.00079)
+Scheduling focus: KVCache-centric disaggregated architecture.
+Key ideas:
+- Treats KV cache as the center of system architecture.
+- Supports separation of compute and KV-serving paths.
+System takeaways: explicit KV-service design helps both scaling and scheduling flexibility.
+
+### 10.4 CachedAttention for Multi-turn Serving (arXiv 2403.19708)
+Scheduling focus: cache-aware optimization for multi-turn conversations.
+Key ideas:
+- Reuses cross-turn cached attention state.
+- Targets cost-efficient serving under long dialogues.
+System takeaways: cache reuse policy is a major scheduling lever for chat workloads.
+
+### 10.5 P/D-Serve (arXiv 2408.08147)
+Scheduling focus: disaggregated serving at scale.
+Key ideas:
+- Scales prefilling and decoding through phase disaggregation.
+- Emphasizes practical cluster-level deployment.
+System takeaways: large-scale disaggregation needs scheduling policies that are bandwidth-aware.
+
+### 10.6 HeteGen (arXiv 2403.01164)
+Scheduling focus: heterogeneous parallel inference under constrained resources.
+Key ideas:
+- Uses heterogeneous devices collaboratively for LLM inference.
+- Focuses on resource-constrained deployment scenarios.
+System takeaways: heterogeneous device scheduling broadens feasible deployment targets.
+
+### 10.7 Efficient Streaming LMs with Attention Sinks (arXiv 2309.17453)
+Scheduling focus: long-stream memory management.
+Key ideas:
+- Introduces attention sinks to stabilize streaming with limited context.
+- Enables long-session decoding with bounded memory.
+System takeaways: streaming stability can be improved with structured cache-retention policies.
+
+### 10.8 H2O (arXiv 2306.14048)
+Scheduling focus: heavy-hitter based KV cache retention.
+Key ideas:
+- Preserves high-importance tokens in KV cache.
+- Evicts low-importance KV entries during generation.
+System takeaways: importance-aware eviction improves memory-latency tradeoffs.
+
+### 10.9 Scissorhands (arXiv 2305.17118)
+Scheduling focus: test-time KV cache compression.
+Key ideas:
+- Exploits persistence of importance for KV pruning.
+- Compresses KV cache with limited quality loss.
+System takeaways: practical KV compression can increase effective batch capacity.
+
+### 10.10 KIVI (arXiv 2402.02750)
+Scheduling focus: KV cache quantization for serving efficiency.
+Key ideas:
+- Tuning-free asymmetric 2-bit KV quantization.
+- Reduces KV memory footprint for long outputs.
+System takeaways: quantized KV is a direct lever for higher concurrency.
+
+### 10.11 SnapKV (arXiv 2404.14469)
+Scheduling focus: selective KV retention before generation.
+Key ideas:
+- Identifies and keeps likely critical context for decoding.
+- Reduces unnecessary KV storage costs.
+System takeaways: pre-selection of KV can improve memory efficiency under long prompts.
+
+### 10.12 Punica (arXiv 2310.18547)
+Scheduling focus: multi-tenant LoRA serving.
+Key ideas:
+- Optimizes serving of many LoRA adapters on shared base models.
+- Improves throughput in adapter-rich multi-tenant settings.
+System takeaways: adapter-aware batching and memory management are core for SaaS-style serving.
+
+### 10.13 Medusa (arXiv 2401.10774)
+Scheduling focus: speculative-style acceleration without separate draft model.
+Key ideas:
+- Adds multiple decoding heads to predict several future tokens.
+- Uses tree-based verification for parallel acceptance.
+System takeaways: auxiliary-head scheduling provides a deploy-friendly alternative to dual-model speculation.
+
+### 10.14 EAGLE (arXiv 2401.15077)
+Scheduling focus: feature-level speculative sampling.
+Key ideas:
+- Reframes speculation around second-to-top-layer feature prediction.
+- Addresses feature uncertainty in speculative acceleration.
+System takeaways: feature-level predictors can improve speculation acceptance and speed.
+
+### 10.15 Recurrent Drafter (arXiv 2403.09919)
+Scheduling focus: efficient draft generation for speculation.
+Key ideas:
+- Recurrent drafter produces candidate tokens for fast verification.
+- Reduces drafter overhead versus full draft models.
+System takeaways: lightweight drafters improve speculation cost/performance.
+
+### 10.16 Lookahead Decoding (arXiv 2402.02057)
+Scheduling focus: breaking sequential dependency in decoding.
+Key ideas:
+- Lookahead mechanism anticipates future tokens with parallel checks.
+- Targets lower decoding latency under autoregressive constraints.
+System takeaways: lookahead planning is a practical scheduling primitive for decode acceleration.
+
+## 11. Additional references (batch 4)
+- Splitwise: https://arxiv.org/abs/2311.18677
+- Inference without Interference: https://arxiv.org/abs/2401.11181
+- Mooncake: https://arxiv.org/abs/2407.00079
+- CachedAttention for Multi-turn Serving: https://arxiv.org/abs/2403.19708
+- P/D-Serve: https://arxiv.org/abs/2408.08147
+- HeteGen: https://arxiv.org/abs/2403.01164
+- Efficient Streaming LMs with Attention Sinks: https://arxiv.org/abs/2309.17453
+- H2O: https://arxiv.org/abs/2306.14048
+- Scissorhands: https://arxiv.org/abs/2305.17118
+- KIVI: https://arxiv.org/abs/2402.02750
+- SnapKV: https://arxiv.org/abs/2404.14469
+- Punica: https://arxiv.org/abs/2310.18547
+- Medusa: https://arxiv.org/abs/2401.10774
+- EAGLE: https://arxiv.org/abs/2401.15077
+- Recurrent Drafter: https://arxiv.org/abs/2403.09919
+- Lookahead Decoding: https://arxiv.org/abs/2402.02057
+

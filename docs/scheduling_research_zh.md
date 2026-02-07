@@ -430,3 +430,134 @@
 - Locality-Aware Fair Scheduling: https://arxiv.org/abs/2501.14312
 - SpotServe: https://arxiv.org/abs/2311.15566
 
+## 10. 新增阅读论文（第 4 批）
+### 10.1 Splitwise（arXiv 2311.18677）
+调度关注点：将 prompt 计算与 token 生成进行阶段拆分。
+核心要点：
+- 将 prefill（算力密集）与 decode（内存密集）部署在不同机器。
+- 优化跨阶段状态传输与高速互联利用。
+系统启示：按阶段匹配硬件可提升吞吐与成本效率。
+
+### 10.2 Inference without Interference（arXiv 2401.11181）
+调度关注点：混合负载下的解耦推理服务。
+核心要点：
+- 解耦不同服务阶段，降低负载相互干扰。
+- 提升异构请求间的隔离性。
+系统启示：解耦策略可显著提升生产环境稳定性。
+
+### 10.3 Mooncake（arXiv 2407.00079）
+调度关注点：以 KVCache 为中心的解耦架构。
+核心要点：
+- 将 KV cache 作为系统架构中心。
+- 支持计算路径与 KV 服务路径分离。
+系统启示：显式 KV 服务化有利于扩缩与调度灵活性。
+
+### 10.4 CachedAttention for Multi-turn Serving（arXiv 2403.19708）
+调度关注点：多轮对话场景下的 cache 感知优化。
+核心要点：
+- 复用多轮会话中的注意力缓存状态。
+- 面向长对话降低服务成本。
+系统启示：跨轮缓存复用策略是聊天场景的重要调度杠杆。
+
+### 10.5 P/D-Serve（arXiv 2408.08147）
+调度关注点：大规模解耦推理服务。
+核心要点：
+- 通过 prefill/decode 解耦实现阶段扩展。
+- 强调集群级部署实践。
+系统启示：大规模解耦必须与带宽感知调度配合。
+
+### 10.6 HeteGen（arXiv 2403.01164）
+调度关注点：资源受限场景下的异构并行推理。
+核心要点：
+- 让异构设备协同完成 LLM 推理。
+- 聚焦资源受限部署场景。
+系统启示：异构设备调度可扩大可部署范围。
+
+### 10.7 Efficient Streaming LMs with Attention Sinks（arXiv 2309.17453）
+调度关注点：长流式推理的内存管理。
+核心要点：
+- 通过 attention sinks 稳定受限上下文下的流式生成。
+- 在有界内存下支持更长会话。
+系统启示：结构化缓存保留策略可提升流式稳定性。
+
+### 10.8 H2O（arXiv 2306.14048）
+调度关注点：基于 heavy-hitter 的 KV 保留策略。
+核心要点：
+- 优先保留高重要度 token 的 KV。
+- 在生成过程中驱逐低重要度 KV。
+系统启示：重要度感知驱逐可优化内存-延迟权衡。
+
+### 10.9 Scissorhands（arXiv 2305.17118）
+调度关注点：测试时 KV cache 压缩。
+核心要点：
+- 利用重要度持久性进行 KV 剪枝。
+- 在较小质量损失下压缩 KV。
+系统启示：实用 KV 压缩可提升有效 batch 容量。
+
+### 10.10 KIVI（arXiv 2402.02750）
+调度关注点：服务场景下的 KV 量化。
+核心要点：
+- 免调参的非对称 2-bit KV 量化。
+- 降低长输出场景下 KV 内存占用。
+系统启示：KV 量化是提升并发的直接手段。
+
+### 10.11 SnapKV（arXiv 2404.14469）
+调度关注点：生成前的选择性 KV 保留。
+核心要点：
+- 提前识别并保留可能关键的上下文。
+- 减少不必要的 KV 存储成本。
+系统启示：KV 预筛选可提升长 prompt 下内存效率。
+
+### 10.12 Punica（arXiv 2310.18547）
+调度关注点：多租户 LoRA 服务。
+核心要点：
+- 优化共享 base model 上的大量 LoRA 适配器服务。
+- 提升适配器密集场景吞吐。
+系统启示：adapter 感知 batch 与内存管理是 SaaS 场景关键。
+
+### 10.13 Medusa（arXiv 2401.10774）
+调度关注点：无需独立草稿模型的 speculative 风格加速。
+核心要点：
+- 增加多解码头预测未来 token。
+- 结合树状验证并行接受。
+系统启示：辅助解码头是双模型 speculation 的可部署替代。
+
+### 10.14 EAGLE（arXiv 2401.15077）
+调度关注点：特征级 speculative sampling。
+核心要点：
+- 以次顶层特征预测重构 speculative 过程。
+- 针对特征不确定性优化加速质量。
+系统启示：特征级预测可提升接受率与加速收益。
+
+### 10.15 Recurrent Drafter（arXiv 2403.09919）
+调度关注点：高效草稿生成器。
+核心要点：
+- 用 recurrent drafter 生成候选 token 供快速验证。
+- 相比完整草稿模型降低额外开销。
+系统启示：轻量草稿器能改善 speculation 的成本/性能。
+
+### 10.16 Lookahead Decoding（arXiv 2402.02057）
+调度关注点：打破解码串行依赖。
+核心要点：
+- 用 lookahead 机制提前规划未来 token 并并行校验。
+- 在自回归约束下降低解码延迟。
+系统启示：lookahead 规划是实用的解码加速原语。
+
+## 11. 新增参考链接（第 4 批）
+- Splitwise: https://arxiv.org/abs/2311.18677
+- Inference without Interference: https://arxiv.org/abs/2401.11181
+- Mooncake: https://arxiv.org/abs/2407.00079
+- CachedAttention for Multi-turn Serving: https://arxiv.org/abs/2403.19708
+- P/D-Serve: https://arxiv.org/abs/2408.08147
+- HeteGen: https://arxiv.org/abs/2403.01164
+- Efficient Streaming LMs with Attention Sinks: https://arxiv.org/abs/2309.17453
+- H2O: https://arxiv.org/abs/2306.14048
+- Scissorhands: https://arxiv.org/abs/2305.17118
+- KIVI: https://arxiv.org/abs/2402.02750
+- SnapKV: https://arxiv.org/abs/2404.14469
+- Punica: https://arxiv.org/abs/2310.18547
+- Medusa: https://arxiv.org/abs/2401.10774
+- EAGLE: https://arxiv.org/abs/2401.15077
+- Recurrent Drafter: https://arxiv.org/abs/2403.09919
+- Lookahead Decoding: https://arxiv.org/abs/2402.02057
+

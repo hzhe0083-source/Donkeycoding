@@ -1,0 +1,20 @@
+services:
+  orchestrator:
+    container_name: workerflow-orchestrator-dev
+    build:
+      context: ..
+      dockerfile: docker/Dockerfile.orchestrator
+    working_dir: /workspace
+    volumes:
+      - ..:/workspace
+      - cargo-registry:/usr/local/cargo/registry
+      - cargo-git:/usr/local/cargo/git
+      - cargo-target:/workspace/target
+    stdin_open: true
+    tty: true
+    restart: unless-stopped
+
+volumes:
+  cargo-registry:
+  cargo-git:
+  cargo-target:

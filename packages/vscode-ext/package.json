@@ -1,0 +1,63 @@
+{
+  "name": "workerflow-vscode-ext",
+  "displayName": "Workerflow",
+  "description": "Workerflow VS Code extension scaffold",
+  "version": "0.0.1",
+  "engines": {
+    "vscode": "^1.90.0"
+  },
+  "categories": [
+    "Other"
+  ],
+  "activationEvents": [
+    "onCommand:workerflow.openChat",
+    "onCommand:workerflow.openDashboard",
+    "onCommand:workerflow.pingEngine",
+    "onCommand:workerflow.startSession",
+    "onCommand:workerflow.showLogs"
+  ],
+  "main": "./out/extension.js",
+  "contributes": {
+    "configuration": {
+      "title": "Workerflow",
+      "properties": {
+        "workerflow.orchestratorPath": {
+          "type": "string",
+          "default": "",
+          "description": "Path to orchestrator executable. If empty, extension uses workspace target/debug binary."
+        }
+      }
+    },
+    "commands": [
+      {
+        "command": "workerflow.openChat",
+        "title": "Workerflow: Open Chat"
+      },
+      {
+        "command": "workerflow.openDashboard",
+        "title": "Workerflow: Open Dashboard"
+      },
+      {
+        "command": "workerflow.pingEngine",
+        "title": "Workerflow: Ping Engine"
+      },
+      {
+        "command": "workerflow.startSession",
+        "title": "Workerflow: Start Session"
+      },
+      {
+        "command": "workerflow.showLogs",
+        "title": "Workerflow: Show Engine Logs"
+      }
+    ]
+  },
+  "scripts": {
+    "build": "tsc -p .",
+    "watch": "tsc -watch -p ."
+  },
+  "devDependencies": {
+    "@types/node": "~20.14.10",
+    "@types/vscode": "^1.90.0",
+    "typescript": "^5.5.4"
+  }
+}
