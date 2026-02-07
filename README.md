@@ -17,6 +17,19 @@ Donkey Studio 的当前形态是一个 **Rust Orchestrator + VS Code Studio 前�
 cargo build -p orchestrator
 ```
 
+### 一键启动（Windows）
+
+在仓库根目录双击或终端运行：
+
+```bat
+start_workerflow.bat
+```
+
+它会自动执行：
+- `cargo build -p orchestrator`
+- `packages/vscode-ext` 的 `npm install`（首次）与 `npm run build`
+- 启动 VS Code 扩展开发窗口（Extension Development Host）
+
 产物路径：
 
 - Windows: `target/debug/orchestrator.exe`
@@ -74,12 +87,66 @@ npm run build
   - `session/start`
   - `chat/send`
   - `chat/stop`
+  - `session/state`
+  - `config/setKeys`
 - 已接通通知：
   - `session/state`
   - `session/participants`
   - `session/progress`
   - `turn/chunk`
   - `turn/complete`
+
+## Orchestrator 算子链（已接入）
+
+`session/start` 支持传入 `operators`，用于控制每轮执行前后逻辑（输入清洗、上下文窗口、参与者筛选、输出格式约束等）。
+
+示例：
+
+```json
+{
+  "task": "给 monorepo 增加 CI 质量门禁",
+  "operators": {
+    "chain": [
+      { "name": "sanitize_input", "enabled": true, "config": { "max_chars": 3000 } },
+      { "name": "context_window", "enabled": true, "config": { "max_messages": 20 } },
+      { "name": "participant_selector", "enabled": true, "config": { "max_participants": 2 } },
+      { "name": "role_response_format", "enabled": true, "config": { "json_mode": false } },
+      { "name": "output_guard", "enabled": true, "config": { "min_chars": 16 } }
+    ]
+  }
+}
+```
+
+当前内置算子：
+- `sanitize_input`
+- `context_window`
+- `participant_selector`
+- `role_response_format`
+- `review_instruction`
+- `review_findings`
+- `output_guard`
+
+## 审核工程化（Review Policy）
+
+`session/start` 可同时传 `review`，用于控制审核输出门槛和报告聚合策略。
+
+示例：
+
+```json
+{
+  "task": "审核本次 PR 的安全与正确性风险",
+  "review": {
+    "enabled": true,
+    "language": "zh-CN",
+    "min_severity": "MEDIUM",
+    "max_findings": 6,
+    "require_evidence": true,
+    "categories": ["correctness", "security", "performance"]
+  }
+}
+```
+
+完成后 `session/start` 返回中会包含 `review` 聚合结果（summary / overall_risk / findings）。
 
 ## Docker 开发模式（可选）
 
@@ -142,3 +209,9 @@ npm run tauri:build
   - `Run Tests` / `Generate Artifact` 仍是前端占位流。
   - Cloud 目标切换目前主要体现于前端与请求参数，后端路由待接入。
 - 若看到 `node_modules/@types/node/*.d.ts` 飘红，通常是 TS Server 问题，不影响本项目构建；可尝试 `TypeScript: Restart TS Server`。
+
+## Launch Notes (Windows)
+
+- `start_workerflow.bat`：默认启动 **Donkey Studio 桌面窗口**（`packages/studio-web` + `tauri:dev`）。
+- `start_vscode_mode.bat`：启动 **VS Code 扩展调试模式**（Extension Development Host）。
+- `scripts/start_desktop_mode.ps1 -Web`：改为启动 **Web 模式**（Vite dev server）。

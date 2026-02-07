@@ -1,81 +1,14 @@
-use serde::{Deserialize, Serialize};
+mod adapter;
+mod engine;
+mod operators;
+mod types;
+
+use engine::{write_message, Engine};
 use serde_json::{json, Value};
 use std::io::{self, BufRead, Read, Write};
+use types::*;
 
-#[derive(Debug, Default)]
-struct EngineState {
-    active_session_id: Option<String>,
-    turn_index: u64,
-    event_seq: u64,
-}
-
-impl EngineState {
-    fn next_event_seq(&mut self) -> u64 {
-        self.event_seq += 1;
-        self.event_seq
-    }
-
-    fn next_turn(&mut self) -> u64 {
-        self.turn_index += 1;
-        self.turn_index
-    }
-}
-
-#[derive(Debug, Deserialize)]
-struct JsonRpcRequest {
-    #[allow(dead_code)]
-    jsonrpc: Option<String>,
-    id: Option<Value>,
-    method: String,
-    params: Option<Value>,
-}
-
-#[derive(Debug, Serialize)]
-struct JsonRpcResponse {
-    jsonrpc: &'static str,
-    id: Value,
-    result: Value,
-}
-
-#[derive(Debug, Serialize)]
-struct JsonRpcErrorResponse {
-    jsonrpc: &'static str,
-    id: Value,
-    error: JsonRpcError,
-}
-
-#[derive(Debug, Serialize)]
-struct JsonRpcError {
-    code: i32,
-    message: String,
-}
-
-fn session_id_from_task(task: &str) -> String {
-    format!("sess-{}", task.replace(' ', "-").to_lowercase())
-}
-
-fn default_participants() -> Value {
-    json!([
-        {
-            "participant_id": "p-openai-proposer",
-            "role": "proposer",
-            "provider": "openai",
-            "model_id": "gpt-4.1"
-        },
-        {
-            "participant_id": "p-anthropic-critic",
-            "role": "critic",
-            "provider": "anthropic",
-            "model_id": "claude-3.7-sonnet"
-        },
-        {
-            "participant_id": "p-google-arbiter",
-            "role": "arbiter",
-            "provider": "google",
-            "model_id": "gemini-2.0-flash"
-        }
-    ])
-}
+// ─── JSON-RPC 读取 ───────────────────────────────────────────────
 
 fn read_headers<R: BufRead>(reader: &mut R) -> io::Result<Option<usize>> {
     let mut content_length: Option<usize> = None;
@@ -91,22 +24,13 @@ fn read_headers<R: BufRead>(reader: &mut R) -> io::Result<Option<usize>> {
         }
         if let Some((key, value)) = line_trimmed.split_once(':') {
             if key.eq_ignore_ascii_case("Content-Length") {
-                let parsed = value
-                    .trim()
-                    .parse::<usize>()
-                    .map_err(|_| io::Error::new(io::ErrorKind::InvalidData, "invalid Content-Length"))?;
+                let parsed = value.trim().parse::<usize>().map_err(|_| {
+                    io::Error::new(io::ErrorKind::InvalidData, "invalid Content-Length")
+                })?;
                 content_length = Some(parsed);
             }
         }
     }
-}
-
-fn write_message<W: Write>(writer: &mut W, payload: &Value) -> io::Result<()> {
-    let bytes = serde_json::to_vec(payload)
-        .map_err(|err| io::Error::new(io::ErrorKind::InvalidData, err.to_string()))?;
-    write!(writer, "Content-Length: {}\r\n\r\n", bytes.len())?;
-    writer.write_all(&bytes)?;
-    writer.flush()
 }
 
 fn write_response<W: Write>(writer: &mut W, response: &JsonRpcResponse) -> io::Result<()> {
@@ -121,211 +45,317 @@ fn write_error<W: Write>(writer: &mut W, response: &JsonRpcErrorResponse) -> io:
     write_message(writer, &value)
 }
 
-fn write_notification<W: Write>(writer: &mut W, method: &str, params: Value) -> io::Result<()> {
-    let notification = json!({
-        "jsonrpc": "2.0",
-        "method": method,
-        "params": params
-    });
-    write_message(writer, &notification)
-}
+// ─── 请求处理 ────────────────────────────────────────────────────
 
-fn normalize_message_to_reply(message: &str) -> String {
-    let trimmed = message.trim();
-    if trimmed.is_empty() {
-        return "我收到了空消息。你可以描述一下具体任务，我来给出方案。".to_string();
-    }
+/// 处理 config/setKeys：设置 API Keys
+fn handle_set_keys(engine: &mut Engine, params: Option<&Value>) -> Result<Value, JsonRpcError> {
+    let params = params.ok_or_else(|| JsonRpcError {
+        code: -32602,
+        message: "Missing params for config/setKeys".to_string(),
+    })?;
 
-    if trimmed.chars().count() <= 80 {
-        return format!(
-            "收到：\"{}\"\n\n建议下一步：\n1) 明确目标\n2) 给出约束\n3) 让我生成可执行计划",
-            trimmed
-        );
-    }
-
-    format!(
-        "我已收到你的需求摘要：\n{}\n\n我建议先拆成三个部分：\n- 目标定义\n- 技术方案\n- 验收标准",
-        trimmed
-    )
-}
-
-fn chunk_text(text: &str, max_chars: usize) -> Vec<String> {
-    if max_chars == 0 {
-        return vec![text.to_string()];
-    }
-
-    let mut chunks: Vec<String> = Vec::new();
-    let mut current = String::new();
-
-    for ch in text.chars() {
-        current.push(ch);
-        if current.chars().count() >= max_chars {
-            chunks.push(current.clone());
-            current.clear();
-        }
-    }
-
-    if !current.is_empty() {
-        chunks.push(current);
-    }
-
-    if chunks.is_empty() {
-        chunks.push(String::new());
-    }
-
-    chunks
-}
-
-fn emit_chat_stream<W: Write>(
-    writer: &mut W,
-    state: &mut EngineState,
-    session_id: &str,
-    turn_index: u64,
-    participant_id: &str,
-    assistant_text: &str,
-) -> io::Result<()> {
-    for delta in chunk_text(assistant_text, 28) {
-        write_notification(
-            writer,
-            "turn/chunk",
-            json!({
-                "session_id": session_id,
-                "turn_index": turn_index,
-                "event_seq": state.next_event_seq(),
-                "participant_id": participant_id,
-                "delta": delta,
-            }),
-        )?;
-    }
-
-    write_notification(
-        writer,
-        "turn/complete",
-        json!({
-            "session_id": session_id,
-            "turn_index": turn_index,
-            "event_seq": state.next_event_seq(),
-            "participant_id": participant_id,
-            "status": "success",
-            "latency_ms": 120,
-        }),
-    )?;
-
-    write_notification(
-        writer,
-        "session/progress",
-        json!({
-            "session_id": session_id,
-            "turn_index": turn_index,
-            "event_seq": state.next_event_seq(),
-            "total_tokens": 128 + (turn_index as i64 * 32),
-            "total_cost": 0.0032 + (turn_index as f64 * 0.0006),
-            "agreement_score": 0.58 + (turn_index as f64 * 0.03),
-        }),
-    )?;
-
-    Ok(())
-}
-
-fn handle_method(method: &str, params: Option<Value>) -> Result<Value, JsonRpcError> {
-    match method {
-        "ping" => Ok(json!({ "pong": true })),
-        "session/start" => {
-            let task = params
-                .as_ref()
-                .and_then(|p| p.get("task"))
-                .and_then(Value::as_str)
-                .unwrap_or("untitled-task");
-
-            let session_id = session_id_from_task(task);
-            let participants = default_participants();
-
-            Ok(json!({
-                "session_id": session_id,
-                "status": "running",
-                "participants": participants,
-                "stats": {
-                    "total_tokens": 0,
-                    "total_cost": 0.0,
-                    "agreement_score": 0.0
-                }
-            }))
-        }
-        "chat/stop" => {
-            let session_id = params
-                .as_ref()
-                .and_then(|p| p.get("session_id"))
-                .and_then(Value::as_str)
-                .unwrap_or("sess-chat");
-
-            Ok(json!({
-                "session_id": session_id,
-                "status": "stopped"
-            }))
-        }
-        _ => Err(JsonRpcError {
-            code: -32601,
-            message: format!("Method not found: {method}"),
-        }),
-    }
-}
-
-fn handle_chat_send<W: Write>(
-    writer: &mut W,
-    state: &mut EngineState,
-    params: Option<&Value>,
-) -> io::Result<Value> {
-    let provided_session_id = params
-        .and_then(|p| p.get("session_id"))
-        .and_then(Value::as_str)
-        .map(ToOwned::to_owned);
-
-    let session_id = if let Some(id) = provided_session_id {
-        id
-    } else if let Some(active) = state.active_session_id.clone() {
-        active
-    } else {
-        "sess-chat".to_string()
+    let keys = ApiKeys {
+        openai: params
+            .get("openai")
+            .and_then(Value::as_str)
+            .unwrap_or("")
+            .to_string(),
+        anthropic: params
+            .get("anthropic")
+            .and_then(Value::as_str)
+            .unwrap_or("")
+            .to_string(),
+        google: params
+            .get("google")
+            .and_then(Value::as_str)
+            .unwrap_or("")
+            .to_string(),
+        deepseek: params
+            .get("deepseek")
+            .and_then(Value::as_str)
+            .unwrap_or("")
+            .to_string(),
     };
 
-    state.active_session_id = Some(session_id.clone());
+    let configured: Vec<&str> = [
+        (!keys.openai.is_empty()).then_some("openai"),
+        (!keys.anthropic.is_empty()).then_some("anthropic"),
+        (!keys.google.is_empty()).then_some("google"),
+        (!keys.deepseek.is_empty()).then_some("deepseek"),
+    ]
+    .into_iter()
+    .flatten()
+    .collect();
+
+    engine.set_api_keys(keys);
+
+    eprintln!("[engine] API keys updated: {:?}", configured);
+
+    Ok(json!({
+        "status": "ok",
+        "configured_providers": configured,
+    }))
+}
+
+/// 处理 session/start：创建会话并启动多轮会议
+async fn handle_session_start<W: Write>(
+    engine: &mut Engine,
+    params: Option<&Value>,
+    writer: &mut W,
+) -> Result<Value, JsonRpcError> {
+    let task = params
+        .and_then(|p| p.get("task"))
+        .and_then(Value::as_str)
+        .unwrap_or("untitled-task");
+
+    // 解析参与者（如果提供了的话）
+    let participants = if let Some(p_val) = params.and_then(|p| p.get("participants")) {
+        serde_json::from_value::<Vec<Participant>>(p_val.clone()).unwrap_or_else(|_| {
+            eprintln!("[engine] Failed to parse participants, using defaults");
+            engine.default_participants()
+        })
+    } else {
+        engine.default_participants()
+    };
+
+    // 解析策略
+    let policy = if let Some(p_val) = params.and_then(|p| p.get("policy")) {
+        serde_json::from_value::<Policy>(p_val.clone()).unwrap_or_default()
+    } else {
+        Policy::default()
+    };
+
+    // 解析预算
+    let budget = if let Some(b_val) = params.and_then(|p| p.get("budget")) {
+        serde_json::from_value::<Budget>(b_val.clone()).unwrap_or_default()
+    } else {
+        Budget::default()
+    };
+
+    // 解析算子链配置
+    let operators = if let Some(o_val) = params.and_then(|p| p.get("operators")) {
+        serde_json::from_value::<OperatorsConfig>(o_val.clone()).unwrap_or_default()
+    } else {
+        OperatorsConfig::default()
+    };
+
+    // 解析审核策略
+    let review = if let Some(r_val) = params.and_then(|p| p.get("review")) {
+        serde_json::from_value::<ReviewPolicy>(r_val.clone()).unwrap_or_default()
+    } else {
+        ReviewPolicy::default()
+    };
+
+    eprintln!(
+        "[engine] Starting session: task={}, participants={}, max_rounds={}",
+        task,
+        participants.len(),
+        policy.stop.max_rounds.min(budget.max_rounds),
+    );
+
+    // 创建会话
+    let session = engine.create_session(task, participants, policy, budget, operators, review);
+    let session_id = session.session_id.clone();
+
+    // 运行多轮会议
+    match engine.run_meeting(&session_id, writer).await {
+        Ok(result) => Ok(result),
+        Err(err) => {
+            eprintln!("[engine] Meeting error: {err}");
+            // 即使出错也返回会话信息
+            Ok(json!({
+                "session_id": session_id,
+                "status": "failed",
+                "error": err,
+            }))
+        }
+    }
+}
+
+/// 处理 chat/send：在现有会话中发送消息并获取回复
+async fn handle_chat_send<W: Write>(
+    engine: &mut Engine,
+    params: Option<&Value>,
+    writer: &mut W,
+) -> Result<Value, JsonRpcError> {
+    let session_id = params
+        .and_then(|p| p.get("session_id"))
+        .and_then(Value::as_str);
 
     let user_message = params
         .and_then(|p| p.get("message"))
         .and_then(Value::as_str)
         .unwrap_or("");
 
-    let assistant_text = normalize_message_to_reply(user_message);
-    let turn_index = state.next_turn();
-    let participant_id = "p-openai-assistant";
+    if user_message.trim().is_empty() {
+        return Err(JsonRpcError {
+            code: -32602,
+            message: "Empty message".to_string(),
+        });
+    }
 
-    emit_chat_stream(
-        writer,
-        state,
-        &session_id,
-        turn_index,
-        participant_id,
-        &assistant_text,
-    )?;
+    // 如果有 session_id，尝试在现有会话中追加消息
+    // 否则创建新会话
+    let sid = if let Some(sid) = session_id {
+        if engine.get_session(sid).is_some() {
+            // 追加用户消息到历史
+            if let Some(session) = engine.get_session_mut(sid) {
+                session.history.push(ChatMessage {
+                    role: "user".to_string(),
+                    content: user_message.to_string(),
+                    participant_id: None,
+                });
+                session.status = "running".to_string();
+            }
+            sid.to_string()
+        } else {
+            // 会话不存在，创建新的
+            let participants = engine.default_participants();
+            let session = engine.create_session(
+                user_message,
+                participants,
+                Policy::default(),
+                Budget::default(),
+                OperatorsConfig::default(),
+                ReviewPolicy::default(),
+            );
+            let new_sid = session.session_id.clone();
+            if let Some(session) = engine.get_session_mut(&new_sid) {
+                session.history.push(ChatMessage {
+                    role: "user".to_string(),
+                    content: user_message.to_string(),
+                    participant_id: None,
+                });
+            }
+            new_sid
+        }
+    } else {
+        // 无 session_id，创建新会话
+        let participants = engine.default_participants();
+        let session = engine.create_session(
+            user_message,
+            participants,
+            Policy::default(),
+            Budget::default(),
+            OperatorsConfig::default(),
+            ReviewPolicy::default(),
+        );
+        let new_sid = session.session_id.clone();
+        if let Some(session) = engine.get_session_mut(&new_sid) {
+            session.history.push(ChatMessage {
+                role: "user".to_string(),
+                content: user_message.to_string(),
+                participant_id: None,
+            });
+        }
+        new_sid
+    };
+
+    eprintln!(
+        "[engine] chat/send: session={}, message_len={}",
+        sid,
+        user_message.len()
+    );
+
+    // 执行一轮讨论
+    match engine.execute_turn(&sid, writer).await {
+        Ok(turn_result) => {
+            let session = engine.get_session(&sid);
+            Ok(json!({
+                "session_id": sid,
+                "status": session.map(|s| s.status.as_str()).unwrap_or("unknown"),
+                "turn_index": turn_result.turn_index,
+                "agreement_score": turn_result.agreement_score,
+                "outputs_count": turn_result.outputs.len(),
+                "total_tokens": session.map(|s| s.total_tokens).unwrap_or(0),
+                "total_cost": session.map(|s| s.total_cost).unwrap_or(0.0),
+            }))
+        }
+        Err(err) => {
+            eprintln!("[engine] chat/send turn error: {err}");
+            Err(JsonRpcError {
+                code: -32000,
+                message: format!("Turn execution failed: {err}"),
+            })
+        }
+    }
+}
+
+/// 处理 chat/stop：停止会话
+fn handle_chat_stop(engine: &mut Engine, params: Option<&Value>) -> Result<Value, JsonRpcError> {
+    let session_id = params
+        .and_then(|p| p.get("session_id"))
+        .and_then(Value::as_str)
+        .unwrap_or("unknown");
+
+    if let Some(session) = engine.get_session_mut(session_id) {
+        session.status = "stopped".to_string();
+        eprintln!("[engine] Session stopped: {session_id}");
+    }
 
     Ok(json!({
         "session_id": session_id,
-        "status": "running",
-        "turn_index": turn_index,
-        "assistant_text": assistant_text,
-        "participant_id": participant_id,
+        "status": "stopped",
     }))
 }
 
-fn main() -> io::Result<()> {
+/// 处理 session/state：查询会话状态
+fn handle_session_state(engine: &Engine, params: Option<&Value>) -> Result<Value, JsonRpcError> {
+    let session_id = params
+        .and_then(|p| p.get("session_id"))
+        .and_then(Value::as_str)
+        .ok_or_else(|| JsonRpcError {
+            code: -32602,
+            message: "Missing session_id".to_string(),
+        })?;
+
+    let session = engine.get_session(session_id).ok_or_else(|| JsonRpcError {
+        code: -32001,
+        message: format!("Session not found: {session_id}"),
+    })?;
+
+    Ok(json!({
+        "session_id": session.session_id,
+        "status": session.status,
+        "current_turn": session.current_turn,
+        "total_tokens": session.total_tokens,
+        "total_cost": session.total_cost,
+        "turns_count": session.turns.len(),
+        "participants_count": session.participants.len(),
+    }))
+}
+
+// ─── 主循环 ──────────────────────────────────────────────────────
+
+#[tokio::main]
+async fn main() -> io::Result<()> {
+    eprintln!("[engine] Workerflow Orchestrator starting...");
+
     let stdin = io::stdin();
     let stdout = io::stdout();
     let mut reader = io::BufReader::new(stdin.lock());
     let mut writer = io::BufWriter::new(stdout.lock());
-    let mut state = EngineState::default();
+
+    // 从环境变量加载 API Keys
+    let api_keys = ApiKeys::from_env();
+    let configured: Vec<&str> = [
+        (!api_keys.openai.is_empty()).then_some("openai"),
+        (!api_keys.anthropic.is_empty()).then_some("anthropic"),
+        (!api_keys.google.is_empty()).then_some("google"),
+        (!api_keys.deepseek.is_empty()).then_some("deepseek"),
+    ]
+    .into_iter()
+    .flatten()
+    .collect();
+    eprintln!("[engine] API keys from env: {:?}", configured);
+
+    let mut engine = Engine::new(api_keys);
+
+    eprintln!("[engine] Ready, waiting for JSON-RPC requests on stdin...");
 
     loop {
         let Some(content_length) = read_headers(&mut reader)? else {
+            eprintln!("[engine] stdin closed, shutting down.");
             break;
         };
 
@@ -334,7 +364,8 @@ fn main() -> io::Result<()> {
 
         let request: JsonRpcRequest = match serde_json::from_slice(&body) {
             Ok(req) => req,
-            Err(_) => {
+            Err(err) => {
+                eprintln!("[engine] Parse error: {err}");
                 let error = JsonRpcErrorResponse {
                     jsonrpc: "2.0",
                     id: Value::Null,
@@ -348,108 +379,57 @@ fn main() -> io::Result<()> {
             }
         };
 
-        if request.method == "session/start" {
-            let task = request
-                .params
-                .as_ref()
-                .and_then(|p| p.get("task"))
-                .and_then(Value::as_str)
-                .unwrap_or("untitled-task");
-            let session_id = session_id_from_task(task);
-            let participants = default_participants();
-            state.active_session_id = Some(session_id.clone());
-            state.turn_index = 0;
-            state.event_seq = 0;
+        eprintln!(
+            "[engine] Received: method={}, id={:?}",
+            request.method, request.id
+        );
 
-            let _ = write_notification(
-                &mut writer,
-                "session/state",
-                json!({
-                    "session_id": session_id,
-                    "status": "running",
-                    "event_seq": state.next_event_seq(),
-                    "reason": "session_started"
-                }),
-            );
-            let _ = write_notification(
-                &mut writer,
-                "session/participants",
-                json!({
-                    "session_id": session_id,
-                    "event_seq": state.next_event_seq(),
-                    "participants": participants
-                }),
-            );
-            let _ = write_notification(
-                &mut writer,
-                "session/progress",
-                json!({
-                    "session_id": session_id,
-                    "event_seq": state.next_event_seq(),
-                    "turn_index": 1,
-                    "total_tokens": 128,
-                    "total_cost": 0.0032,
-                    "agreement_score": 0.62
-                }),
-            );
-            state.turn_index = 1;
-            let _ = write_notification(
-                &mut writer,
-                "turn/complete",
-                json!({
-                    "session_id": session_id,
-                    "turn_index": 1,
-                    "event_seq": state.next_event_seq(),
-                    "participant_id": "p-openai-proposer",
-                    "status": "success",
-                    "latency_ms": 835
-                }),
-            );
-        }
+        // 处理请求
+        let Some(id) = request.id else {
+            // Notification（无 id），目前忽略
+            eprintln!("[engine] Ignoring notification: {}", request.method);
+            continue;
+        };
 
-        if let Some(id) = request.id {
-            if request.method == "chat/send" {
-                match handle_chat_send(&mut writer, &mut state, request.params.as_ref()) {
-                    Ok(result) => {
-                        let response = JsonRpcResponse {
-                            jsonrpc: "2.0",
-                            id,
-                            result,
-                        };
-                        write_response(&mut writer, &response)?;
-                    }
-                    Err(err) => {
-                        let response = JsonRpcErrorResponse {
-                            jsonrpc: "2.0",
-                            id,
-                            error: JsonRpcError {
-                                code: -32000,
-                                message: format!("chat/send failed: {err}"),
-                            },
-                        };
-                        write_error(&mut writer, &response)?;
-                    }
-                }
-                continue;
+        let result = match request.method.as_str() {
+            "ping" => Ok(json!({ "pong": true })),
+
+            "config/setKeys" => handle_set_keys(&mut engine, request.params.as_ref()),
+
+            "session/start" => {
+                handle_session_start(&mut engine, request.params.as_ref(), &mut writer).await
             }
 
-            match handle_method(&request.method, request.params) {
-                Ok(result) => {
-                    let response = JsonRpcResponse {
-                        jsonrpc: "2.0",
-                        id,
-                        result,
-                    };
-                    write_response(&mut writer, &response)?;
-                }
-                Err(error) => {
-                    let response = JsonRpcErrorResponse {
-                        jsonrpc: "2.0",
-                        id,
-                        error,
-                    };
-                    write_error(&mut writer, &response)?;
-                }
+            "chat/send" => {
+                handle_chat_send(&mut engine, request.params.as_ref(), &mut writer).await
+            }
+
+            "chat/stop" => handle_chat_stop(&mut engine, request.params.as_ref()),
+
+            "session/state" => handle_session_state(&engine, request.params.as_ref()),
+
+            _ => Err(JsonRpcError {
+                code: -32601,
+                message: format!("Method not found: {}", request.method),
+            }),
+        };
+
+        match result {
+            Ok(result_value) => {
+                let response = JsonRpcResponse {
+                    jsonrpc: "2.0",
+                    id,
+                    result: result_value,
+                };
+                write_response(&mut writer, &response)?;
+            }
+            Err(error) => {
+                let response = JsonRpcErrorResponse {
+                    jsonrpc: "2.0",
+                    id,
+                    error,
+                };
+                write_error(&mut writer, &response)?;
             }
         }
     }
