@@ -1,6 +1,7 @@
 import { invoke } from "@tauri-apps/api/core";
 import { applyRpcResult } from "./notifications";
 import {
+  getOfficeBySessionId,
   getActiveOffice,
   pushLog,
   setSessionOffice,
@@ -9,6 +10,12 @@ import {
 } from "./state";
 import type { RpcResult } from "./types";
 import { safeJson, toErrorMessage } from "./utils";
+
+export type ActionResult = {
+  ok: boolean;
+  message: string;
+  sessionId?: string;
+};
 
 function parseCategories(text: string): string[] {
   return text
@@ -43,7 +50,7 @@ export async function refreshOrchestratorStatus(): Promise<void> {
   }
 }
 
-export async function startOrchestrator(): Promise<void> {
+export async function startOrchestrator(): Promise<ActionResult> {
   state.runStatus = "starting";
 
   try {
@@ -53,10 +60,17 @@ export async function startOrchestrator(): Promise<void> {
     state.orchestratorRunning = result.success;
     state.runStatus = result.success ? "running" : "error";
     pushLog(`start_orchestrator: ${safeJson(result.data)}`);
+    if (result.success) {
+      return { ok: true, message: "引擎启动成功" };
+    }
+    const reason = result.error ? `：${result.error}` : "";
+    return { ok: false, message: `引擎启动失败${reason}` };
   } catch (error) {
     state.orchestratorRunning = false;
     state.runStatus = "error";
+    const message = `引擎启动失败：${toErrorMessage(error)}`;
     pushLog(`start_orchestrator failed: ${toErrorMessage(error)}`);
+    return { ok: false, message };
   }
 }
 
@@ -95,7 +109,7 @@ export async function pingEngine(): Promise<void> {
   }
 }
 
-export async function setKeys(): Promise<void> {
+export async function setKeys(): Promise<ActionResult> {
   try {
     await callRpc("config/setKeys", {
       openai: state.apiKeys.openai,
@@ -103,15 +117,23 @@ export async function setKeys(): Promise<void> {
       google: state.apiKeys.google,
       deepseek: state.apiKeys.deepseek,
     });
+    return { ok: true, message: "API Keys 已同步" };
   } catch (error) {
+    const message = `同步 Keys 失败：${toErrorMessage(error)}`;
     pushLog(`config/setKeys failed: ${toErrorMessage(error)}`);
+    return { ok: false, message };
   }
 }
 
-export async function startOfficeDebate(): Promise<void> {
+export async function startOfficeDebate(): Promise<ActionResult> {
+  const office = getActiveOffice();
+  if (!office) {
+    return { ok: false, message: "请先新建办公室" };
+  }
+
   try {
-    const office = getActiveOffice();
     const categories = parseCategories(state.review.categoriesText);
+    const objective = office.objective.trim();
 
     const chain = state.operators
       .filter((operator) => operator.name.trim().length > 0)
@@ -130,6 +152,16 @@ export async function startOfficeDebate(): Promise<void> {
         model_id: member.modelId,
       }));
 
+    if (!objective) {
+      throw new Error("请先填写办公室目标");
+    }
+    if (!Number.isFinite(office.maxRounds) || office.maxRounds < 1 || office.maxRounds > 20) {
+      throw new Error("轮次需在 1 到 20 之间");
+    }
+    if (participants.some((participant) => !participant.model_id.trim())) {
+      throw new Error("启用成员必须填写模型 ID");
+    }
+
     if (participants.length < 2) {
       throw new Error("至少启用两个 AI 员工，才能开始辩论");
     }
@@ -141,13 +173,13 @@ export async function startOfficeDebate(): Promise<void> {
     }
 
     updateOfficeSnapshot(office.officeId, {
-      status: "running",
+      status: "starting",
       turnIndex: 0,
-      lastSummary: "办公室会议已启动，等待员工开始发言...",
+      lastSummary: "办公室会议启动中...",
     });
 
     const result = await callRpc("session/start", {
-      task: office.objective,
+      task: objective,
       participants,
       policy: {
         stop: {
@@ -173,17 +205,30 @@ export async function startOfficeDebate(): Promise<void> {
       setSessionOffice(sessionId, office.officeId);
       updateOfficeSnapshot(office.officeId, { sessionId, status: "running" });
       state.sessionId = sessionId;
+      return { ok: true, message: `办公室已启动（${sessionId}）`, sessionId };
     }
+
+    updateOfficeSnapshot(office.officeId, {
+      status: "running",
+      lastSummary: "已发起 session/start，等待会话 ID 回传",
+    });
+    return { ok: true, message: "已发起办公室讨论" };
   } catch (error) {
-    pushLog(`startOfficeDebate failed: ${toErrorMessage(error)}`);
+    const reason = toErrorMessage(error);
+    pushLog(`startOfficeDebate failed: ${reason}`);
+    updateOfficeSnapshot(office.officeId, {
+      status: "error",
+      lastSummary: `启动失败：${reason}`,
+    });
     state.runStatus = "error";
+    return { ok: false, message: `启动失败：${reason}` };
   }
 }
 
-export async function sendOfficeChat(message: string): Promise<void> {
+export async function sendOfficeChat(message: string): Promise<ActionResult> {
   const trimmed = message.trim();
   if (!trimmed) {
-    return;
+    return { ok: false, message: "请输入消息后再发送" };
   }
 
   try {
@@ -192,21 +237,38 @@ export async function sendOfficeChat(message: string): Promise<void> {
       params.session_id = state.sessionId;
     }
     await callRpc("chat/send", params);
+    return { ok: true, message: "消息已发送" };
   } catch (error) {
-    pushLog(`chat/send failed: ${toErrorMessage(error)}`);
+    const reason = toErrorMessage(error);
+    pushLog(`chat/send failed: ${reason}`);
+    return { ok: false, message: `发送失败：${reason}` };
   }
 }
 
-export async function stopOfficeDebate(): Promise<void> {
+export async function stopOfficeDebate(): Promise<ActionResult> {
   if (state.sessionId === "-") {
     pushLog("chat/stop skipped: no active session");
-    return;
+    return { ok: false, message: "当前没有可停止的会话" };
   }
 
+  const targetSessionId = state.sessionId;
+
   try {
-    await callRpc("chat/stop", { session_id: state.sessionId });
+    await callRpc("chat/stop", { session_id: targetSessionId });
+
+    const office = getOfficeBySessionId(targetSessionId);
+    if (office) {
+      updateOfficeSnapshot(office.officeId, {
+        status: "stopped",
+        lastSummary: "会话已停止",
+      });
+    }
+
+    return { ok: true, message: "已发送停止指令" };
   } catch (error) {
-    pushLog(`chat/stop failed: ${toErrorMessage(error)}`);
+    const reason = toErrorMessage(error);
+    pushLog(`chat/stop failed: ${reason}`);
+    return { ok: false, message: `停止失败：${reason}` };
   }
 }
 

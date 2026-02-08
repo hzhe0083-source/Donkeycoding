@@ -1,4 +1,4 @@
-mod adapter;
+﻿mod adapter;
 mod engine;
 mod operators;
 mod types;
@@ -8,7 +8,7 @@ use serde_json::{json, Value};
 use std::io::{self, BufRead, Read, Write};
 use types::*;
 
-// ─── JSON-RPC 读取 ───────────────────────────────────────────────
+// 鈹€鈹€鈹€ JSON-RPC 璇诲彇 鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€
 
 fn read_headers<R: BufRead>(reader: &mut R) -> io::Result<Option<usize>> {
     let mut content_length: Option<usize> = None;
@@ -45,9 +45,9 @@ fn write_error<W: Write>(writer: &mut W, response: &JsonRpcErrorResponse) -> io:
     write_message(writer, &value)
 }
 
-// ─── 请求处理 ────────────────────────────────────────────────────
+// 鈹€鈹€鈹€ 璇锋眰澶勭悊 鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€
 
-/// 处理 config/setKeys：设置 API Keys
+/// 澶勭悊 config/setKeys锛氳缃?API Keys
 fn handle_set_keys(engine: &mut Engine, params: Option<&Value>) -> Result<Value, JsonRpcError> {
     let params = params.ok_or_else(|| JsonRpcError {
         code: -32602,
@@ -97,72 +97,62 @@ fn handle_set_keys(engine: &mut Engine, params: Option<&Value>) -> Result<Value,
     }))
 }
 
-/// 处理 session/start：创建会话并启动多轮会议
+/// 澶勭悊 session/start锛氬垱寤轰細璇濆苟鍚姩澶氳疆浼氳
 async fn handle_session_start<W: Write>(
     engine: &mut Engine,
     params: Option<&Value>,
     writer: &mut W,
 ) -> Result<Value, JsonRpcError> {
-    let task = params
-        .and_then(|p| p.get("task"))
-        .and_then(Value::as_str)
-        .unwrap_or("untitled-task");
-
-    // 解析参与者（如果提供了的话）
-    let participants = if let Some(p_val) = params.and_then(|p| p.get("participants")) {
-        serde_json::from_value::<Vec<Participant>>(p_val.clone()).unwrap_or_else(|_| {
-            eprintln!("[engine] Failed to parse participants, using defaults");
-            engine.default_participants()
-        })
-    } else {
-        engine.default_participants()
+    let default_request = || MeetingRequest {
+        task: "untitled-task".to_string(),
+        participants: Vec::new(),
+        policy: Policy::default(),
+        budget: Budget::default(),
+        operators: OperatorsConfig::default(),
+        review: ReviewPolicy::default(),
     };
 
-    // 解析策略
-    let policy = if let Some(p_val) = params.and_then(|p| p.get("policy")) {
-        serde_json::from_value::<Policy>(p_val.clone()).unwrap_or_default()
+    let mut request = if let Some(raw) = params {
+        match serde_json::from_value::<MeetingRequest>(raw.clone()) {
+            Ok(parsed) => parsed,
+            Err(err) => {
+                eprintln!("[engine] Failed to parse MeetingRequest, using defaults: {err}");
+                default_request()
+            }
+        }
     } else {
-        Policy::default()
+        default_request()
     };
 
-    // 解析预算
-    let budget = if let Some(b_val) = params.and_then(|p| p.get("budget")) {
-        serde_json::from_value::<Budget>(b_val.clone()).unwrap_or_default()
-    } else {
-        Budget::default()
-    };
+    if request.task.trim().is_empty() {
+        request.task = "untitled-task".to_string();
+    }
 
-    // 解析算子链配置
-    let operators = if let Some(o_val) = params.and_then(|p| p.get("operators")) {
-        serde_json::from_value::<OperatorsConfig>(o_val.clone()).unwrap_or_default()
-    } else {
-        OperatorsConfig::default()
-    };
-
-    // 解析审核策略
-    let review = if let Some(r_val) = params.and_then(|p| p.get("review")) {
-        serde_json::from_value::<ReviewPolicy>(r_val.clone()).unwrap_or_default()
-    } else {
-        ReviewPolicy::default()
-    };
+    if request.participants.is_empty() {
+        request.participants = engine.default_participants();
+    }
 
     eprintln!(
         "[engine] Starting session: task={}, participants={}, max_rounds={}",
-        task,
-        participants.len(),
-        policy.stop.max_rounds.min(budget.max_rounds),
+        request.task,
+        request.participants.len(),
+        request.policy.stop.max_rounds.min(request.budget.max_rounds),
     );
 
-    // 创建会话
-    let session = engine.create_session(task, participants, policy, budget, operators, review);
+    let session = engine.create_session(
+        &request.task,
+        request.participants,
+        request.policy,
+        request.budget,
+        request.operators,
+        request.review,
+    );
     let session_id = session.session_id.clone();
 
-    // 运行多轮会议
     match engine.run_meeting(&session_id, writer).await {
         Ok(result) => Ok(result),
         Err(err) => {
             eprintln!("[engine] Meeting error: {err}");
-            // 即使出错也返回会话信息
             Ok(json!({
                 "session_id": session_id,
                 "status": "failed",
@@ -172,7 +162,7 @@ async fn handle_session_start<W: Write>(
     }
 }
 
-/// 处理 chat/send：在现有会话中发送消息并获取回复
+/// 澶勭悊 chat/send锛氬湪鐜版湁浼氳瘽涓彂閫佹秷鎭苟鑾峰彇鍥炲
 async fn handle_chat_send<W: Write>(
     engine: &mut Engine,
     params: Option<&Value>,
@@ -194,11 +184,11 @@ async fn handle_chat_send<W: Write>(
         });
     }
 
-    // 如果有 session_id，尝试在现有会话中追加消息
-    // 否则创建新会话
+    // 濡傛灉鏈?session_id锛屽皾璇曞湪鐜版湁浼氳瘽涓拷鍔犳秷鎭?
+    // 鍚﹀垯鍒涘缓鏂颁細璇?
     let sid = if let Some(sid) = session_id {
         if engine.get_session(sid).is_some() {
-            // 追加用户消息到历史
+            // 杩藉姞鐢ㄦ埛娑堟伅鍒板巻鍙?
             if let Some(session) = engine.get_session_mut(sid) {
                 session.history.push(ChatMessage {
                     role: "user".to_string(),
@@ -209,7 +199,7 @@ async fn handle_chat_send<W: Write>(
             }
             sid.to_string()
         } else {
-            // 会话不存在，创建新的
+            // 浼氳瘽涓嶅瓨鍦紝鍒涘缓鏂扮殑
             let participants = engine.default_participants();
             let session = engine.create_session(
                 user_message,
@@ -230,7 +220,7 @@ async fn handle_chat_send<W: Write>(
             new_sid
         }
     } else {
-        // 无 session_id，创建新会话
+        // 鏃?session_id锛屽垱寤烘柊浼氳瘽
         let participants = engine.default_participants();
         let session = engine.create_session(
             user_message,
@@ -257,7 +247,7 @@ async fn handle_chat_send<W: Write>(
         user_message.len()
     );
 
-    // 执行一轮讨论
+    // 鎵ц涓€杞璁?
     match engine.execute_turn(&sid, writer).await {
         Ok(turn_result) => {
             let session = engine.get_session(&sid);
@@ -281,7 +271,7 @@ async fn handle_chat_send<W: Write>(
     }
 }
 
-/// 处理 chat/stop：停止会话
+/// 澶勭悊 chat/stop锛氬仠姝細璇?
 fn handle_chat_stop(engine: &mut Engine, params: Option<&Value>) -> Result<Value, JsonRpcError> {
     let session_id = params
         .and_then(|p| p.get("session_id"))
@@ -299,7 +289,7 @@ fn handle_chat_stop(engine: &mut Engine, params: Option<&Value>) -> Result<Value
     }))
 }
 
-/// 处理 session/state：查询会话状态
+/// 澶勭悊 session/state锛氭煡璇細璇濈姸鎬?
 fn handle_session_state(engine: &Engine, params: Option<&Value>) -> Result<Value, JsonRpcError> {
     let session_id = params
         .and_then(|p| p.get("session_id"))
@@ -325,7 +315,7 @@ fn handle_session_state(engine: &Engine, params: Option<&Value>) -> Result<Value
     }))
 }
 
-// ─── 主循环 ──────────────────────────────────────────────────────
+// 鈹€鈹€鈹€ 涓诲惊鐜?鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€
 
 #[tokio::main]
 async fn main() -> io::Result<()> {
@@ -336,7 +326,7 @@ async fn main() -> io::Result<()> {
     let mut reader = io::BufReader::new(stdin.lock());
     let mut writer = io::BufWriter::new(stdout.lock());
 
-    // 从环境变量加载 API Keys
+    // 浠庣幆澧冨彉閲忓姞杞?API Keys
     let api_keys = ApiKeys::from_env();
     let configured: Vec<&str> = [
         (!api_keys.openai.is_empty()).then_some("openai"),
@@ -384,9 +374,9 @@ async fn main() -> io::Result<()> {
             request.method, request.id
         );
 
-        // 处理请求
+        // 澶勭悊璇锋眰
         let Some(id) = request.id else {
-            // Notification（无 id），目前忽略
+            // Notification锛堟棤 id锛夛紝鐩墠蹇界暐
             eprintln!("[engine] Ignoring notification: {}", request.method);
             continue;
         };
@@ -436,3 +426,4 @@ async fn main() -> io::Result<()> {
 
     Ok(())
 }
+

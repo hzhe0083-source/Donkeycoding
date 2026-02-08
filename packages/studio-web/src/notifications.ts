@@ -1,4 +1,5 @@
 import {
+  getActiveOffice,
   getOfficeBySessionId,
   pushChunk,
   pushNotification,
@@ -78,7 +79,10 @@ export function applyRpcResult(_method: string, result: unknown): void {
   if (sessionId) {
     state.sessionId = sessionId;
     if (!state.sessionOfficeMap[sessionId]) {
-      setSessionOffice(sessionId, state.activeOfficeId);
+      const activeOffice = getActiveOffice();
+      if (activeOffice) {
+        setSessionOffice(sessionId, activeOffice.officeId);
+      }
     }
   }
 
@@ -139,7 +143,10 @@ export function handleNotification(envelope: NotificationEnvelope): void {
 
   const sessionId = parseString(params.session_id);
   if (sessionId && !state.sessionOfficeMap[sessionId]) {
-    setSessionOffice(sessionId, state.activeOfficeId);
+    const activeOffice = getActiveOffice();
+    if (activeOffice) {
+      setSessionOffice(sessionId, activeOffice.officeId);
+    }
   }
 
   if (method === "session/state") {

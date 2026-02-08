@@ -6,7 +6,18 @@ export type RunStatus =
   | "stopped"
   | "error";
 
-export type WorkspaceMode = "offices" | "creation" | "review";
+export type WorkspaceMode = "offices" | "dashboard" | "subscription" | "creation" | "review";
+
+export type OfficeStatusFilter = "all" | RunStatus;
+
+export type OfficeSortBy =
+  | "priority"
+  | "updated"
+  | "agreement"
+  | "tokens"
+  | "cost";
+
+export type SortDirection = "asc" | "desc";
 
 export type NotificationMethod =
   | "turn/chunk"
@@ -104,10 +115,31 @@ export type OperatorDraft = {
   configText: string;
 };
 
+export type ToastKind = "info" | "success" | "error";
+
+export type UiToast = {
+  id: number;
+  kind: ToastKind;
+  message: string;
+};
+
+export type BusyAction =
+  | "none"
+  | "syncing-keys"
+  | "starting-office"
+  | "stopping-office"
+  | "sending-human";
+
+export type SubTab = "notifications" | "chunks";
+
 export type DashboardState = {
   orchestratorRunning: boolean;
   runStatus: RunStatus;
+  busyAction: BusyAction;
   workspaceMode: WorkspaceMode;
+  officeStatusFilter: OfficeStatusFilter;
+  officeSortBy: OfficeSortBy;
+  officeSortDirection: SortDirection;
   activeOfficeId: string;
   offices: OfficeDraft[];
   officeSnapshots: Record<string, OfficeSnapshot>;
@@ -121,7 +153,10 @@ export type DashboardState = {
   chunks: ChunkView[];
   notifications: Array<{ time: string; method: string; payload: unknown }>;
   logs: string[];
+  humanDraftByOfficeId: Record<string, string>;
+  toasts: UiToast[];
   apiKeys: ApiKeysForm;
   review: ReviewDraft;
   operators: OperatorDraft[];
+  _subTab: SubTab;
 };

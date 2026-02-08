@@ -1,4 +1,5 @@
 import type {
+  BusyAction,
   ChunkView,
   DashboardState,
   OfficeDraft,
@@ -6,6 +7,7 @@ import type {
   ParticipantView,
   Provider,
   Role,
+  ToastKind,
 } from "./types";
 
 function createDefaultMember(
@@ -56,18 +58,7 @@ function createEmptySnapshot(officeId: string): OfficeSnapshot {
   };
 }
 
-const initialOffices: OfficeDraft[] = [
-  createDefaultOffice(
-    "office-1",
-    "办公室 A",
-    "设计并实现一个可复用的三模型协作创作流程",
-  ),
-  createDefaultOffice(
-    "office-2",
-    "办公室 B",
-    "围绕同一目标提出替代方案，并进行风险评审",
-  ),
-];
+const initialOffices: OfficeDraft[] = [];
 
 const initialSnapshots: Record<string, OfficeSnapshot> = Object.fromEntries(
   initialOffices.map((office) => [office.officeId, createEmptySnapshot(office.officeId)]),
@@ -76,8 +67,12 @@ const initialSnapshots: Record<string, OfficeSnapshot> = Object.fromEntries(
 export const state: DashboardState = {
   orchestratorRunning: false,
   runStatus: "idle",
+  busyAction: "none",
   workspaceMode: "offices",
-  activeOfficeId: "office-1",
+  officeStatusFilter: "all",
+  officeSortBy: "priority",
+  officeSortDirection: "asc",
+  activeOfficeId: "",
   offices: initialOffices,
   officeSnapshots: initialSnapshots,
   sessionOfficeMap: {},
@@ -90,6 +85,8 @@ export const state: DashboardState = {
   chunks: [],
   notifications: [],
   logs: [],
+  humanDraftByOfficeId: {},
+  toasts: [],
   apiKeys: {
     openai: "",
     anthropic: "",
@@ -113,15 +110,39 @@ export const state: DashboardState = {
     { name: "review_findings", enabled: true, configText: "null" },
     { name: "output_guard", enabled: true, configText: "null" },
   ],
+  _subTab: "notifications",
 };
 
-export function getActiveOffice(): OfficeDraft {
+let nextToastId = 1;
+
+export function setBusyAction(action: BusyAction): void {
+  state.busyAction = action;
+}
+
+export function pushToast(kind: ToastKind, message: string): number {
+  const id = nextToastId;
+  nextToastId += 1;
+
+  state.toasts = [...state.toasts, { id, kind, message }].slice(-4);
+  return id;
+}
+
+export function dismissToast(id: number): void {
+  state.toasts = state.toasts.filter((toast) => toast.id !== id);
+}
+
+export function getActiveOffice(): OfficeDraft | undefined {
   const found = state.offices.find((office) => office.officeId === state.activeOfficeId);
   if (found) {
     return found;
   }
 
   const fallback = state.offices[0];
+  if (!fallback) {
+    state.activeOfficeId = "";
+    return undefined;
+  }
+
   state.activeOfficeId = fallback.officeId;
   return fallback;
 }
@@ -137,11 +158,14 @@ export function getOfficeBySessionId(sessionId: string): OfficeDraft | undefined
   if (!officeId) {
     return undefined;
   }
-
   return state.offices.find((office) => office.officeId === officeId);
 }
 
 export function setSessionOffice(sessionId: string, officeId: string): void {
+  if (!officeId || !state.offices.some((office) => office.officeId === officeId)) {
+    return;
+  }
+
   state.sessionOfficeMap[sessionId] = officeId;
   updateOfficeSnapshot(officeId, { sessionId });
 }
@@ -205,7 +229,8 @@ export function removeOffice(officeId: string): void {
   }
 
   if (state.activeOfficeId === officeId) {
-    state.activeOfficeId = state.offices[0].officeId;
+    const fallback = state.offices[0];
+    state.activeOfficeId = fallback ? fallback.officeId : "";
   }
 }
 

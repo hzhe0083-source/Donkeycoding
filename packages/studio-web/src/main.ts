@@ -3,7 +3,7 @@ import { handleNotification } from "./notifications";
 import { refreshOrchestratorStatus } from "./rpc";
 import { pushLog, pushNotification, state } from "./state";
 import type { NotificationEnvelope, NotificationMethod } from "./types";
-import { mountStyles, render } from "./ui";
+import { mountStyles, patchDiscussionStream, render } from "./ui";
 
 async function bootstrap(): Promise<void> {
   mountStyles();
@@ -20,7 +20,11 @@ async function bootstrap(): Promise<void> {
         method === "session/participants"
       ) {
         handleNotification(event.payload);
-        render();
+        if (method === "turn/chunk" && state.workspaceMode === "offices") {
+          patchDiscussionStream();
+        } else {
+          render();
+        }
         return;
       }
     }
@@ -47,4 +51,3 @@ async function bootstrap(): Promise<void> {
 }
 
 void bootstrap();
-
