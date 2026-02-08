@@ -60,6 +60,11 @@ fn handle_set_keys(engine: &mut Engine, params: Option<&Value>) -> Result<Value,
             .and_then(Value::as_str)
             .unwrap_or("")
             .to_string(),
+        openai_compatible: params
+            .get("openai_compatible")
+            .and_then(Value::as_str)
+            .unwrap_or("")
+            .to_string(),
         anthropic: params
             .get("anthropic")
             .and_then(Value::as_str)
@@ -79,6 +84,7 @@ fn handle_set_keys(engine: &mut Engine, params: Option<&Value>) -> Result<Value,
 
     let configured: Vec<&str> = [
         (!keys.openai.is_empty()).then_some("openai"),
+        (!keys.openai_compatible.is_empty()).then_some("openai_compatible"),
         (!keys.anthropic.is_empty()).then_some("anthropic"),
         (!keys.google.is_empty()).then_some("google"),
         (!keys.deepseek.is_empty()).then_some("deepseek"),
@@ -163,6 +169,15 @@ async fn handle_session_start<W: Write>(
 }
 
 /// 澶勭悊 chat/send锛氬湪鐜版湁浼氳瘽涓彂閫佹秷鎭苟鑾峰彇鍥炲
+fn parse_chat_participants(params: Option<&Value>) -> Option<Vec<Participant>> {
+    let raw = params.and_then(|p| p.get("participants"))?.clone();
+    let parsed = serde_json::from_value::<Vec<Participant>>(raw).ok()?;
+    if parsed.is_empty() {
+        return None;
+    }
+    Some(parsed)
+}
+
 async fn handle_chat_send<W: Write>(
     engine: &mut Engine,
     params: Option<&Value>,
@@ -184,6 +199,8 @@ async fn handle_chat_send<W: Write>(
         });
     }
 
+    let custom_participants = parse_chat_participants(params);
+
     // 濡傛灉鏈?session_id锛屽皾璇曞湪鐜版湁浼氳瘽涓拷鍔犳秷鎭?
     // 鍚﹀垯鍒涘缓鏂颁細璇?
     let sid = if let Some(sid) = session_id {
@@ -200,7 +217,9 @@ async fn handle_chat_send<W: Write>(
             sid.to_string()
         } else {
             // 浼氳瘽涓嶅瓨鍦紝鍒涘缓鏂扮殑
-            let participants = engine.default_participants();
+            let participants = custom_participants
+                .clone()
+                .unwrap_or_else(|| engine.default_participants());
             let session = engine.create_session(
                 user_message,
                 participants,
@@ -221,7 +240,7 @@ async fn handle_chat_send<W: Write>(
         }
     } else {
         // 鏃?session_id锛屽垱寤烘柊浼氳瘽
-        let participants = engine.default_participants();
+        let participants = custom_participants.unwrap_or_else(|| engine.default_participants());
         let session = engine.create_session(
             user_message,
             participants,
@@ -251,12 +270,27 @@ async fn handle_chat_send<W: Write>(
     match engine.execute_turn(&sid, writer).await {
         Ok(turn_result) => {
             let session = engine.get_session(&sid);
+            let outputs = turn_result
+                .outputs
+                .iter()
+                .map(|output| {
+                    json!({
+                        "participant_id": output.participant_id,
+                        "status": output.status,
+                        "content": output.content,
+                        "latency_ms": output.latency_ms,
+                        "error": output.error,
+                    })
+                })
+                .collect::<Vec<Value>>();
+
             Ok(json!({
                 "session_id": sid,
                 "status": session.map(|s| s.status.as_str()).unwrap_or("unknown"),
                 "turn_index": turn_result.turn_index,
                 "agreement_score": turn_result.agreement_score,
                 "outputs_count": turn_result.outputs.len(),
+                "outputs": outputs,
                 "total_tokens": session.map(|s| s.total_tokens).unwrap_or(0),
                 "total_cost": session.map(|s| s.total_cost).unwrap_or(0.0),
             }))
@@ -315,6 +349,33 @@ fn handle_session_state(engine: &Engine, params: Option<&Value>) -> Result<Value
     }))
 }
 
+/// 澶勭悊 workflow/execute锛氭寜姝ラ璋冪敤 API / 鎵ц鍛戒护锛屽彲閫夊洖鍒颁細璇濊璁?
+async fn handle_workflow_execute<W: Write>(
+    engine: &mut Engine,
+    params: Option<&Value>,
+    writer: &mut W,
+) -> Result<Value, JsonRpcError> {
+    let raw = params.ok_or_else(|| JsonRpcError {
+        code: -32602,
+        message: "Missing params for workflow/execute".to_string(),
+    })?;
+
+    let request: WorkflowExecuteRequest = serde_json::from_value(raw.clone()).map_err(|err| {
+        JsonRpcError {
+            code: -32602,
+            message: format!("Invalid workflow/execute params: {err}"),
+        }
+    })?;
+
+    engine
+        .execute_workflow(request, writer)
+        .await
+        .map_err(|err| JsonRpcError {
+            code: -32000,
+            message: err,
+        })
+}
+
 // 鈹€鈹€鈹€ 涓诲惊鐜?鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€
 
 #[tokio::main]
@@ -330,6 +391,7 @@ async fn main() -> io::Result<()> {
     let api_keys = ApiKeys::from_env();
     let configured: Vec<&str> = [
         (!api_keys.openai.is_empty()).then_some("openai"),
+        (!api_keys.openai_compatible.is_empty()).then_some("openai_compatible"),
         (!api_keys.anthropic.is_empty()).then_some("anthropic"),
         (!api_keys.google.is_empty()).then_some("google"),
         (!api_keys.deepseek.is_empty()).then_some("deepseek"),
@@ -397,6 +459,10 @@ async fn main() -> io::Result<()> {
             "chat/stop" => handle_chat_stop(&mut engine, request.params.as_ref()),
 
             "session/state" => handle_session_state(&engine, request.params.as_ref()),
+
+            "workflow/execute" => {
+                handle_workflow_execute(&mut engine, request.params.as_ref(), &mut writer).await
+            }
 
             _ => Err(JsonRpcError {
                 code: -32601,

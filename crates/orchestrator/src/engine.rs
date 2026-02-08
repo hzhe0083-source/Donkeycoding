@@ -1,10 +1,15 @@
 use crate::adapter::LlmAdapter;
 use crate::operators::{OperatorRegistry, TurnContext};
 use crate::types::*;
+use reqwest::Method;
 use serde_json::{json, Value};
 use std::cmp::Ordering;
 use std::collections::HashMap;
 use std::io::Write;
+use std::process::Stdio;
+use std::time::Instant;
+use tokio::process::Command;
+use tokio::time::{timeout, Duration};
 
 const STREAM_CHUNK_CHARS: usize = 80;
 const HISTORY_LIMIT: usize = 80;
@@ -135,6 +140,19 @@ impl Engine {
                 endpoint: String::new(),
                 vote_weight: 1.0,
                 priority: 3,
+            });
+        }
+
+        if !keys.openai_compatible.is_empty() {
+            participants.push(Participant {
+                participant_id: "p-compatible-proposer".to_string(),
+                role: Role::Proposer,
+                provider: Provider::OpenAICompatible,
+                model_id: "gpt-4o-mini".to_string(),
+                api_key: String::new(),
+                endpoint: String::new(),
+                vote_weight: 1.0,
+                priority: 4,
             });
         }
 
@@ -333,6 +351,355 @@ impl Engine {
         }
 
         Ok(turn_result)
+    }
+
+    pub async fn execute_workflow<W: Write>(
+        &mut self,
+        request: WorkflowExecuteRequest,
+        writer: &mut W,
+    ) -> Result<Value, String> {
+        if request.steps.is_empty() {
+            return Err("workflow steps is empty".to_string());
+        }
+
+        let mut step_results = Vec::new();
+        let mut halted = false;
+
+        for (index, step) in request.steps.iter().cloned().enumerate() {
+            let result = self.execute_workflow_step(index, step).await;
+
+            let seq = self.next_event_seq();
+            let _ = write_notification(
+                writer,
+                "workflow/step",
+                json!({
+                    "event_seq": seq,
+                    "session_id": if request.session_id.trim().is_empty() {
+                        Value::Null
+                    } else {
+                        Value::String(request.session_id.clone())
+                    },
+                    "index": result.index,
+                    "name": result.name,
+                    "kind": result.kind,
+                    "status": result.status,
+                    "duration_ms": result.duration_ms,
+                    "status_code": result.status_code,
+                    "error": result.error,
+                    "output_preview": truncate_text(&result.output, 500),
+                }),
+            );
+
+            let failed = result.status != "success";
+            step_results.push(result);
+
+            if failed && request.stop_on_error {
+                halted = true;
+                break;
+            }
+        }
+
+        let mut session_id = request.session_id.trim().to_string();
+        let mut followup_turn: Option<TurnResult> = None;
+        let mut followup_error: Option<String> = None;
+
+        if request.continue_chat {
+            let followup_prompt = if request.followup_prompt.trim().is_empty() {
+                "已执行落地步骤，请基于结果继续推进 coding：先总结，再给出下一步最小可执行改动。"
+                    .to_string()
+            } else {
+                request.followup_prompt.trim().to_string()
+            };
+
+            let summary = build_workflow_summary(&step_results);
+            let user_message = format!("{}\n\n{}", followup_prompt, summary);
+
+            if session_id.is_empty() || self.get_session(&session_id).is_none() {
+                let participants = self.default_participants();
+                let session = self.create_session(
+                    &followup_prompt,
+                    participants,
+                    Policy::default(),
+                    Budget::default(),
+                    OperatorsConfig::default(),
+                    ReviewPolicy::default(),
+                );
+                session_id = session.session_id.clone();
+            }
+
+            if let Some(session) = self.get_session_mut(&session_id) {
+                session.status = "running".to_string();
+                session.history.push(ChatMessage {
+                    role: "user".to_string(),
+                    content: user_message,
+                    participant_id: None,
+                });
+            }
+
+            match self.execute_turn(&session_id, writer).await {
+                Ok(turn) => followup_turn = Some(turn),
+                Err(err) => followup_error = Some(err),
+            }
+        }
+
+        let success_count = step_results
+            .iter()
+            .filter(|item| item.status == "success")
+            .count();
+        let error_count = step_results.len().saturating_sub(success_count);
+
+        let status = if followup_error.is_some() {
+            "completed_with_chat_error"
+        } else if halted {
+            "stopped_on_error"
+        } else if error_count > 0 {
+            "completed_with_errors"
+        } else {
+            "completed"
+        };
+
+        let seq = self.next_event_seq();
+        let _ = write_notification(
+            writer,
+            "workflow/complete",
+            json!({
+                "event_seq": seq,
+                "session_id": if session_id.is_empty() {
+                    Value::Null
+                } else {
+                    Value::String(session_id.clone())
+                },
+                "status": status,
+                "steps_total": step_results.len(),
+                "steps_success": success_count,
+                "steps_error": error_count,
+                "halted": halted,
+                "continue_chat": request.continue_chat,
+                "followup_error": followup_error,
+            }),
+        );
+
+        Ok(json!({
+            "status": status,
+            "session_id": if session_id.is_empty() {
+                Value::Null
+            } else {
+                Value::String(session_id)
+            },
+            "steps_total": step_results.len(),
+            "steps_success": success_count,
+            "steps_error": error_count,
+            "halted": halted,
+            "step_results": step_results,
+            "continue_chat": request.continue_chat,
+            "followup_turn": followup_turn,
+            "followup_error": followup_error,
+        }))
+    }
+
+    async fn execute_workflow_step(
+        &self,
+        index: usize,
+        step: WorkflowStep,
+    ) -> WorkflowStepResult {
+        match step {
+            WorkflowStep::Http {
+                name,
+                method,
+                url,
+                headers,
+                body,
+                timeout_ms,
+            } => {
+                self.execute_http_step(index, name, method, url, headers, body, timeout_ms)
+                    .await
+            }
+            WorkflowStep::Command {
+                name,
+                command,
+                cwd,
+                timeout_ms,
+            } => {
+                self.execute_command_step(index, name, command, cwd, timeout_ms)
+                    .await
+            }
+        }
+    }
+
+    async fn execute_http_step(
+        &self,
+        index: usize,
+        name: String,
+        method: String,
+        url: String,
+        headers: HashMap<String, String>,
+        body: Value,
+        timeout_ms: u64,
+    ) -> WorkflowStepResult {
+        let started = Instant::now();
+        let request_method = match Method::from_bytes(method.trim().as_bytes()) {
+            Ok(parsed) => parsed,
+            Err(err) => {
+                return WorkflowStepResult {
+                    index,
+                    name,
+                    kind: "http".to_string(),
+                    status: "error".to_string(),
+                    duration_ms: started.elapsed().as_millis() as u64,
+                    output: String::new(),
+                    status_code: None,
+                    error: Some(format!("invalid HTTP method: {err}")),
+                }
+            }
+        };
+
+        let timeout_ms = if timeout_ms == 0 { 30_000 } else { timeout_ms };
+        let client = reqwest::Client::new();
+        let mut request = client
+            .request(request_method.clone(), &url)
+            .timeout(Duration::from_millis(timeout_ms));
+
+        for (key, value) in headers {
+            request = request.header(key, value);
+        }
+
+        if !body.is_null() && request_method != Method::GET && request_method != Method::HEAD {
+            request = request.json(&body);
+        }
+
+        let response = match request.send().await {
+            Ok(resp) => resp,
+            Err(err) => {
+                return WorkflowStepResult {
+                    index,
+                    name,
+                    kind: "http".to_string(),
+                    status: "error".to_string(),
+                    duration_ms: started.elapsed().as_millis() as u64,
+                    output: String::new(),
+                    status_code: None,
+                    error: Some(format!("HTTP request failed: {err}")),
+                }
+            }
+        };
+
+        let status = response.status();
+        let body = match response.text().await {
+            Ok(text) => truncate_text(&text, 6000),
+            Err(err) => format!("<failed to read response body: {err}>"),
+        };
+
+        let success = status.is_success();
+        WorkflowStepResult {
+            index,
+            name,
+            kind: "http".to_string(),
+            status: if success {
+                "success".to_string()
+            } else {
+                "error".to_string()
+            },
+            duration_ms: started.elapsed().as_millis() as u64,
+            output: body,
+            status_code: Some(status.as_u16()),
+            error: if success {
+                None
+            } else {
+                Some(format!("HTTP status {}", status.as_u16()))
+            },
+        }
+    }
+
+    async fn execute_command_step(
+        &self,
+        index: usize,
+        name: String,
+        command: String,
+        cwd: String,
+        timeout_ms: u64,
+    ) -> WorkflowStepResult {
+        let started = Instant::now();
+        let timeout_ms = if timeout_ms == 0 { 120_000 } else { timeout_ms };
+
+        let mut cmd = if cfg!(target_os = "windows") {
+            let mut c = Command::new("powershell.exe");
+            c.arg("-Command").arg(command);
+            c
+        } else {
+            let mut c = Command::new("sh");
+            c.arg("-lc").arg(command);
+            c
+        };
+
+        cmd.stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped());
+
+        if !cwd.trim().is_empty() {
+            cmd.current_dir(cwd);
+        }
+
+        let output = match timeout(Duration::from_millis(timeout_ms), cmd.output()).await {
+            Ok(Ok(output)) => output,
+            Ok(Err(err)) => {
+                return WorkflowStepResult {
+                    index,
+                    name,
+                    kind: "command".to_string(),
+                    status: "error".to_string(),
+                    duration_ms: started.elapsed().as_millis() as u64,
+                    output: String::new(),
+                    status_code: None,
+                    error: Some(format!("command execution failed: {err}")),
+                }
+            }
+            Err(_) => {
+                return WorkflowStepResult {
+                    index,
+                    name,
+                    kind: "command".to_string(),
+                    status: "error".to_string(),
+                    duration_ms: started.elapsed().as_millis() as u64,
+                    output: String::new(),
+                    status_code: None,
+                    error: Some(format!("command timed out after {timeout_ms}ms")),
+                }
+            }
+        };
+
+        let mut merged_output = String::new();
+        if !output.stdout.is_empty() {
+            merged_output.push_str(&String::from_utf8_lossy(&output.stdout));
+        }
+        if !output.stderr.is_empty() {
+            if !merged_output.is_empty() {
+                merged_output.push_str("\n");
+            }
+            merged_output.push_str(&String::from_utf8_lossy(&output.stderr));
+        }
+        if merged_output.trim().is_empty() {
+            merged_output = "<no output>".to_string();
+        }
+
+        let success = output.status.success();
+        WorkflowStepResult {
+            index,
+            name,
+            kind: "command".to_string(),
+            status: if success {
+                "success".to_string()
+            } else {
+                "error".to_string()
+            },
+            duration_ms: started.elapsed().as_millis() as u64,
+            output: truncate_text(&merged_output, 6000),
+            status_code: output.status.code().map(|code| code as u16),
+            error: if success {
+                None
+            } else {
+                Some(format!("command exited with status {}", output.status))
+            },
+        }
     }
 
     pub fn should_stop(&self, session_id: &str) -> (bool, &'static str) {
@@ -638,6 +1005,45 @@ fn chunk_text(text: &str, max_chars: usize) -> Vec<String> {
     }
 
     chunks
+}
+
+fn truncate_text(text: &str, max_chars: usize) -> String {
+    if max_chars == 0 {
+        return String::new();
+    }
+
+    let mut out = String::new();
+    for (index, ch) in text.chars().enumerate() {
+        if index >= max_chars {
+            out.push_str("\n...[truncated]...");
+            break;
+        }
+        out.push(ch);
+    }
+    out
+}
+
+fn build_workflow_summary(results: &[WorkflowStepResult]) -> String {
+    let mut lines = vec!["工作流执行结果：".to_string()];
+
+    for item in results {
+        let mut line = format!(
+            "- [{}] {} ({}) 耗时 {}ms",
+            item.status, item.name, item.kind, item.duration_ms
+        );
+        if let Some(status_code) = item.status_code {
+            line.push_str(&format!(", code={status_code}"));
+        }
+        lines.push(line);
+
+        if let Some(error) = &item.error {
+            lines.push(format!("  error: {}", truncate_text(error, 300)));
+        }
+        let output_preview = truncate_text(&item.output, 500);
+        lines.push(format!("  output: {}", output_preview.replace('\n', " ")));
+    }
+
+    lines.join("\n")
 }
 
 pub fn write_notification<W: Write>(

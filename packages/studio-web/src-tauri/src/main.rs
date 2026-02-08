@@ -37,6 +37,34 @@ type SharedState = Mutex<OrchestratorState>;
 // ─── 辅助：查找 orchestrator 可执行文件 ──────────────────────────
 
 fn find_orchestrator_exe() -> Option<PathBuf> {
+    if let Ok(path) = std::env::var("ORCHESTRATOR_BIN") {
+        let p = PathBuf::from(path);
+        if p.exists() {
+            return Some(p);
+        }
+    }
+
+    let manifest_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+    for ancestor in manifest_dir.ancestors() {
+        let candidate = ancestor.join("target").join("debug").join("orchestrator.exe");
+        if candidate.exists() {
+            return Some(candidate);
+        }
+        let candidate = ancestor.join("target").join("debug").join("orchestrator");
+        if candidate.exists() {
+            return Some(candidate);
+        }
+
+        let candidate = ancestor.join("target").join("release").join("orchestrator.exe");
+        if candidate.exists() {
+            return Some(candidate);
+        }
+        let candidate = ancestor.join("target").join("release").join("orchestrator");
+        if candidate.exists() {
+            return Some(candidate);
+        }
+    }
+
     // 优先查找与当前 exe 同目录
     if let Ok(current_exe) = std::env::current_exe() {
         if let Some(dir) = current_exe.parent() {
@@ -70,13 +98,6 @@ fn find_orchestrator_exe() -> Option<PathBuf> {
     }
 
     // 环境变量覆盖
-    if let Ok(path) = std::env::var("ORCHESTRATOR_BIN") {
-        let p = PathBuf::from(path);
-        if p.exists() {
-            return Some(p);
-        }
-    }
-
     None
 }
 
@@ -296,11 +317,11 @@ async fn send_rpc(
     // 释放锁，等待响应
     drop(guard);
 
-    // 等待响应（超时 60 秒）
-    match tokio::time::timeout(std::time::Duration::from_secs(60), rx).await {
+    // 等待响应（超时 180 秒，兼容高思考模型）
+    match tokio::time::timeout(std::time::Duration::from_secs(180), rx).await {
         Ok(Ok(result)) => result,
         Ok(Err(_)) => Err("Response channel closed".to_string()),
-        Err(_) => Err("RPC request timed out (60s)".to_string()),
+        Err(_) => Err("RPC request timed out (180s)".to_string()),
     }
 }
 

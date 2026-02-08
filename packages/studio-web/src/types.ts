@@ -6,7 +6,13 @@ export type RunStatus =
   | "stopped"
   | "error";
 
-export type WorkspaceMode = "offices" | "dashboard" | "subscription" | "creation" | "review";
+export type WorkspaceMode =
+  | "offices"
+  | "dashboard"
+  | "subscription"
+  | "settings"
+  | "creation"
+  | "review";
 
 export type OfficeStatusFilter = "all" | RunStatus;
 
@@ -24,7 +30,9 @@ export type NotificationMethod =
   | "turn/complete"
   | "session/progress"
   | "session/state"
-  | "session/participants";
+  | "session/participants"
+  | "workflow/step"
+  | "workflow/complete";
 
 export type NotificationEnvelope = {
   jsonrpc?: string;
@@ -40,12 +48,26 @@ export type RpcResult<T = unknown> = {
 
 export type ApiKeysForm = {
   openai: string;
+  openai_compatible: string;
   anthropic: string;
   google: string;
   deepseek: string;
 };
 
-export type Provider = "openai" | "anthropic" | "google" | "deepseek";
+export type GlobalApiConfig = {
+  name: string;
+  provider: Provider;
+  modelId: string;
+  endpoint: string;
+  apiKey: string;
+};
+
+export type Provider =
+  | "openai"
+  | "openai_compatible"
+  | "anthropic"
+  | "google"
+  | "deepseek";
 
 export type Role =
   | "proposer"
@@ -59,6 +81,8 @@ export type OfficeMember = {
   participantId: string;
   provider: Provider;
   modelId: string;
+  endpoint?: string;
+  apiKey?: string;
   role: Role;
   enabled: boolean;
 };
@@ -117,6 +141,57 @@ export type OperatorDraft = {
 
 export type ToastKind = "info" | "success" | "error";
 
+// AI 引导对话相关类型
+export type GuideSender = "ai" | "user" | "system";
+
+export type GuidePhase =
+  | "greeting"       // AI 打招呼，询问目标
+  | "goal-confirm"   // 确认目标
+  | "plan-suggest"   // AI 推荐 workflow 方案
+  | "plan-confirm"   // 用户确认方案
+  | "config-review"  // AI 展示最终配置供确认
+  | "creating"       // 正在创建
+  | "done";          // 完成
+
+export type GuideMessage = {
+  id: number;
+  sender: GuideSender;
+  text: string;
+  timestamp: string;
+  /** 可选：附带快捷操作按钮 */
+  actions?: GuideAction[];
+};
+
+export type GuideAction = {
+  id: string;
+  label: string;
+  /** 点击后的行为类型 */
+  kind: "select-plan" | "confirm" | "edit" | "cancel" | "create";
+  /** 附带数据，如方案 ID */
+  payload?: string;
+};
+
+export type GuideFlowState = {
+  open: boolean;
+  phase: GuidePhase;
+  messages: GuideMessage[];
+  userInput: string;
+  /** 用户确认的目标 */
+  confirmedGoal: string;
+  /** AI 推荐并用户选择的方案 ID */
+  selectedPlanId: string;
+  /** 办公室名称 */
+  officeName: string;
+  /** 最大轮次 */
+  maxRounds: number;
+  /** 是否正在等待 AI 回复 */
+  aiThinking: boolean;
+  /** 是否正在创建办公室 */
+  creating: boolean;
+  /** 引导对话的 session ID，用于匹配 turn/chunk 通知 */
+  sessionId: string;
+};
+
 export type UiToast = {
   id: number;
   kind: ToastKind;
@@ -128,7 +203,8 @@ export type BusyAction =
   | "syncing-keys"
   | "starting-office"
   | "stopping-office"
-  | "sending-human";
+  | "sending-human"
+  | "executing-workflow";
 
 export type SubTab = "notifications" | "chunks";
 
@@ -156,6 +232,11 @@ export type DashboardState = {
   humanDraftByOfficeId: Record<string, string>;
   toasts: UiToast[];
   apiKeys: ApiKeysForm;
+  globalApis: GlobalApiConfig[];
+  activeGlobalApiIndex: number;
+  globalApiImportText: string;
+  openaiCompatibleEndpoint: string;
+  anthropicCompatibleEndpoint: string;
   review: ReviewDraft;
   operators: OperatorDraft[];
   _subTab: SubTab;

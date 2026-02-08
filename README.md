@@ -89,12 +89,48 @@ npm run build
   - `chat/stop`
   - `session/state`
   - `config/setKeys`
+  - `workflow/execute`
 - 已接通通知：
   - `session/state`
   - `session/participants`
   - `session/progress`
   - `turn/chunk`
   - `turn/complete`
+  - `workflow/step`
+  - `workflow/complete`
+
+## Workflow 落地执行（API + Command）
+
+新增 `workflow/execute`，支持在一次调用中串行执行多步流程，并可将执行结果回灌到会话继续讨论。
+
+示例：
+
+```json
+{
+  "session_id": "sess-xxxx",
+  "stop_on_error": true,
+  "continue_chat": true,
+  "followup_prompt": "已执行步骤，请继续给出下一步编码改动",
+  "steps": [
+    {
+      "kind": "http",
+      "name": "health-check",
+      "method": "GET",
+      "url": "https://httpbin.org/get",
+      "timeout_ms": 15000
+    },
+    {
+      "kind": "command",
+      "name": "run-tests",
+      "command": "npm test",
+      "cwd": ".",
+      "timeout_ms": 120000
+    }
+  ]
+}
+```
+
+前端（Donkey Studio）右侧面板新增“落地 Workflow（JSON）”输入框和“执行落地脚本”按钮，可直接触发上述 RPC。
 
 ## Orchestrator 算子链（已接入）
 

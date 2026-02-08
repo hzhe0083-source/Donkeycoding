@@ -1,7 +1,13 @@
 import type {
+  ApiKeysForm,
   BusyAction,
   ChunkView,
   DashboardState,
+  GlobalApiConfig,
+  GuideAction,
+  GuideFlowState,
+  GuideMessage,
+  GuidePhase,
   OfficeDraft,
   OfficeSnapshot,
   ParticipantView,
@@ -89,10 +95,24 @@ export const state: DashboardState = {
   toasts: [],
   apiKeys: {
     openai: "",
+    openai_compatible: "",
     anthropic: "",
     google: "",
     deepseek: "",
   },
+  globalApis: [
+    {
+      name: "默认接口",
+      provider: "openai",
+      modelId: "gpt-4.1",
+      endpoint: "",
+      apiKey: "",
+    },
+  ],
+  activeGlobalApiIndex: 0,
+  globalApiImportText: "",
+  openaiCompatibleEndpoint: "",
+  anthropicCompatibleEndpoint: "",
   review: {
     enabled: true,
     language: "zh-CN",
@@ -252,6 +272,67 @@ export function pushNotification(method: string, payload: unknown): void {
   }
 }
 
+// ─── AI 引导对话状态 ───
+
+let nextGuideMessageId = 1;
+
+export const guideFlow: GuideFlowState = {
+  open: false,
+  phase: "greeting",
+  messages: [],
+  userInput: "",
+  confirmedGoal: "",
+  selectedPlanId: "",
+  officeName: "",
+  maxRounds: 3,
+  aiThinking: false,
+  creating: false,
+  sessionId: "",
+};
+
+export function openGuideFlow(): void {
+  guideFlow.open = true;
+  guideFlow.phase = "greeting";
+  guideFlow.messages = [];
+  guideFlow.userInput = "";
+  guideFlow.confirmedGoal = "";
+  guideFlow.selectedPlanId = "";
+  guideFlow.officeName = "";
+  guideFlow.maxRounds = 3;
+  guideFlow.aiThinking = false;
+  guideFlow.creating = false;
+  guideFlow.sessionId = "";
+
+  // AI 主动打招呼
+  pushGuideMessage("ai", "👋 你好！我是你的 Workerflow 助手。\n\n告诉我你想让 AI 团队帮你完成什么任务？\n比如：\n• 帮我做一个技术方案评审\n• 写一份产品需求文档\n• 分析竞品并给出建议\n\n请描述你的目标，我来帮你组建最合适的 AI 办公室 🏢", []);
+}
+
+export function closeGuideFlow(): void {
+  guideFlow.open = false;
+  guideFlow.aiThinking = false;
+  guideFlow.creating = false;
+}
+
+export function pushGuideMessage(
+  sender: GuideMessage["sender"],
+  text: string,
+  actions?: GuideAction[],
+): GuideMessage {
+  const msg: GuideMessage = {
+    id: nextGuideMessageId++,
+    sender,
+    text,
+    timestamp: new Date().toISOString(),
+    actions,
+  };
+  guideFlow.messages.push(msg);
+  return msg;
+}
+
+export function setGuidePhase(phase: GuidePhase): void {
+  guideFlow.phase = phase;
+}
+
 export function pushChunk(chunk: ChunkView): void {
   state.chunks.unshift(chunk);
   if (state.chunks.length > 400) {
@@ -274,4 +355,79 @@ export function updateParticipant(participantId: string, patch: Partial<Particip
     status: patch.status ?? "pending",
     latencyMs: patch.latencyMs,
   });
+}
+
+// ─── 持久化设置到 localStorage ───
+
+const STORAGE_KEY = "beboss-settings";
+const LEGACY_STORAGE_KEY = "donkey-studio-settings";
+
+type PersistedSettings = {
+  globalApis: GlobalApiConfig[];
+  activeGlobalApiIndex: number;
+  apiKeys: ApiKeysForm;
+  openaiCompatibleEndpoint: string;
+  anthropicCompatibleEndpoint: string;
+  offices: OfficeDraft[];
+};
+
+export function saveSettings(): void {
+  try {
+    const data: PersistedSettings = {
+      globalApis: state.globalApis,
+      activeGlobalApiIndex: state.activeGlobalApiIndex,
+      apiKeys: state.apiKeys,
+      openaiCompatibleEndpoint: state.openaiCompatibleEndpoint,
+      anthropicCompatibleEndpoint: state.anthropicCompatibleEndpoint,
+      offices: state.offices,
+    };
+    localStorage.setItem(STORAGE_KEY, JSON.stringify(data));
+  } catch {
+    // localStorage 不可用时静默忽略
+  }
+}
+
+export function loadSettings(): void {
+  try {
+    const raw = localStorage.getItem(STORAGE_KEY) ?? localStorage.getItem(LEGACY_STORAGE_KEY);
+    if (!raw) {
+      return;
+    }
+
+    if (!localStorage.getItem(STORAGE_KEY)) {
+      localStorage.setItem(STORAGE_KEY, raw);
+    }
+
+    const data = JSON.parse(raw) as Partial<PersistedSettings>;
+
+    if (Array.isArray(data.globalApis) && data.globalApis.length > 0) {
+      state.globalApis = data.globalApis;
+    }
+    if (typeof data.activeGlobalApiIndex === "number" && data.activeGlobalApiIndex >= 0) {
+      state.activeGlobalApiIndex = Math.min(data.activeGlobalApiIndex, state.globalApis.length - 1);
+    }
+    if (data.apiKeys && typeof data.apiKeys === "object") {
+      const keys = data.apiKeys;
+      if (typeof keys.openai === "string") state.apiKeys.openai = keys.openai;
+      if (typeof keys.openai_compatible === "string") state.apiKeys.openai_compatible = keys.openai_compatible;
+      if (typeof keys.anthropic === "string") state.apiKeys.anthropic = keys.anthropic;
+      if (typeof keys.google === "string") state.apiKeys.google = keys.google;
+      if (typeof keys.deepseek === "string") state.apiKeys.deepseek = keys.deepseek;
+    }
+    if (typeof data.openaiCompatibleEndpoint === "string") {
+      state.openaiCompatibleEndpoint = data.openaiCompatibleEndpoint;
+    }
+    if (typeof data.anthropicCompatibleEndpoint === "string") {
+      state.anthropicCompatibleEndpoint = data.anthropicCompatibleEndpoint;
+    }
+    if (Array.isArray(data.offices) && data.offices.length > 0) {
+      state.offices = data.offices;
+      state.officeSnapshots = Object.fromEntries(
+        data.offices.map((office) => [office.officeId, createEmptySnapshot(office.officeId)]),
+      );
+      state.activeOfficeId = data.offices[0].officeId;
+    }
+  } catch {
+    // JSON 解析失败或 localStorage 不可用时静默忽略
+  }
 }

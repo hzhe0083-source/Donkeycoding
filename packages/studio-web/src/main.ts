@@ -1,15 +1,20 @@
 import { listen } from "@tauri-apps/api/event";
 import { handleNotification } from "./notifications";
 import { refreshOrchestratorStatus } from "./rpc";
-import { pushLog, pushNotification, state } from "./state";
+import { guideFlow, loadSettings, pushLog, pushNotification, state } from "./state";
 import type { NotificationEnvelope, NotificationMethod } from "./types";
 import { mountStyles, patchDiscussionStream, render } from "./ui";
 
 async function bootstrap(): Promise<void> {
+  loadSettings();
   mountStyles();
   render();
 
   await listen<NotificationEnvelope>("orchestrator-notification", (event) => {
+    if (event.payload.method) {
+      pushLog(`[notify] ${String(event.payload.method)}`);
+    }
+
     if (event.payload.method) {
       const method = event.payload.method as NotificationMethod | string;
       if (
@@ -17,10 +22,12 @@ async function bootstrap(): Promise<void> {
         method === "turn/complete" ||
         method === "session/progress" ||
         method === "session/state" ||
-        method === "session/participants"
+        method === "session/participants" ||
+        method === "workflow/step" ||
+        method === "workflow/complete"
       ) {
         handleNotification(event.payload);
-        if (method === "turn/chunk" && state.workspaceMode === "offices") {
+        if (method === "turn/chunk" && state.workspaceMode === "offices" && !guideFlow.open) {
           patchDiscussionStream();
         } else {
           render();

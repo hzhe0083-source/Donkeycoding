@@ -1,5 +1,6 @@
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
+use std::collections::HashMap;
 
 // ─── Provider 枚举 ───────────────────────────────────────────────
 
@@ -7,6 +8,8 @@ use serde_json::Value;
 #[serde(rename_all = "lowercase")]
 pub enum Provider {
     OpenAI,
+    #[serde(rename = "openai_compatible")]
+    OpenAICompatible,
     Anthropic,
     Google,
     DeepSeek,
@@ -16,6 +19,7 @@ impl Provider {
     pub fn default_endpoint(&self) -> &'static str {
         match self {
             Provider::OpenAI => "https://api.openai.com/v1/chat/completions",
+            Provider::OpenAICompatible => "",
             Provider::Anthropic => "https://api.anthropic.com/v1/messages",
             Provider::Google => "https://generativelanguage.googleapis.com/v1beta/models",
             Provider::DeepSeek => "https://api.deepseek.com/v1/chat/completions",
@@ -102,6 +106,62 @@ pub struct MeetingRequest {
     pub operators: OperatorsConfig,
     #[serde(default)]
     pub review: ReviewPolicy,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct WorkflowExecuteRequest {
+    #[serde(default)]
+    pub session_id: String,
+    #[serde(default)]
+    pub steps: Vec<WorkflowStep>,
+    #[serde(default = "default_workflow_stop_on_error")]
+    pub stop_on_error: bool,
+    #[serde(default)]
+    pub continue_chat: bool,
+    #[serde(default)]
+    pub followup_prompt: String,
+}
+
+fn default_workflow_stop_on_error() -> bool {
+    true
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum WorkflowStep {
+    Http {
+        name: String,
+        method: String,
+        url: String,
+        #[serde(default)]
+        headers: HashMap<String, String>,
+        #[serde(default)]
+        body: Value,
+        #[serde(default)]
+        timeout_ms: u64,
+    },
+    Command {
+        name: String,
+        command: String,
+        #[serde(default)]
+        cwd: String,
+        #[serde(default)]
+        timeout_ms: u64,
+    },
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct WorkflowStepResult {
+    pub index: usize,
+    pub name: String,
+    pub kind: String,
+    pub status: String,
+    pub duration_ms: u64,
+    pub output: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub status_code: Option<u16>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub error: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -438,6 +498,8 @@ pub struct ApiKeys {
     #[serde(default)]
     pub openai: String,
     #[serde(default)]
+    pub openai_compatible: String,
+    #[serde(default)]
     pub anthropic: String,
     #[serde(default)]
     pub google: String,
@@ -449,6 +511,7 @@ impl ApiKeys {
     pub fn get(&self, provider: &Provider) -> &str {
         match provider {
             Provider::OpenAI => &self.openai,
+            Provider::OpenAICompatible => &self.openai_compatible,
             Provider::Anthropic => &self.anthropic,
             Provider::Google => &self.google,
             Provider::DeepSeek => &self.deepseek,
@@ -459,6 +522,7 @@ impl ApiKeys {
     pub fn from_env() -> Self {
         Self {
             openai: std::env::var("OPENAI_API_KEY").unwrap_or_default(),
+            openai_compatible: std::env::var("OPENAI_COMPATIBLE_API_KEY").unwrap_or_default(),
             anthropic: std::env::var("ANTHROPIC_API_KEY").unwrap_or_default(),
             google: std::env::var("GOOGLE_API_KEY").unwrap_or_default(),
             deepseek: std::env::var("DEEPSEEK_API_KEY").unwrap_or_default(),

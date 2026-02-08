@@ -1,3 +1,24 @@
+import { marked } from "marked";
+
+// 配置 marked：启用 GFM（表格、删除线等），禁用异步
+marked.setOptions({
+  gfm: true,
+  breaks: true,
+  async: false,
+});
+
+/**
+ * 将 Markdown 文本渲染为安全的 HTML。
+ * 用于 AI 消息的富文本展示（表格、加粗、代码块等）。
+ */
+export function renderMarkdown(text: string): string {
+  try {
+    return marked.parse(text) as string;
+  } catch {
+    return escapeHtml(text).replace(/\n/g, "<br>");
+  }
+}
+
 export function safeJson(value: unknown): string {
   try {
     return JSON.stringify(value, null, 2);
