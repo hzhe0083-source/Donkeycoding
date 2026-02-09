@@ -24,6 +24,7 @@ import {
   state,
 } from "./state";
 import type {
+  ApiDuty,
   GlobalApiConfig,
   GuideAction,
   OfficeDraft,
@@ -51,8 +52,7 @@ function hasGuideStreamedReplySince(anchorMessageId: number): boolean {
       return false;
     }
 
-    const [, ...bodyLines] = message.text.split("\n");
-    const body = bodyLines.join("\n").trim();
+    const body = message.text.trim();
     return body.length > 0 && !isThinkingPlaceholder(body);
   });
 }
@@ -79,9 +79,19 @@ function appendGuideOutputsFallback(
   }
 
   for (const output of outputs) {
-    const label = `🤖 ${output.participantId}`;
+    if (isThinkingPlaceholder(output.content)) {
+      continue;
+    }
+
+    const authorLabel =
+      output.participantId === guideFlow.leaderParticipantId
+        ? guideFlow.participantLabels[output.participantId] ?? "秘书（你的分身）"
+        : guideFlow.participantLabels[output.participantId] ?? `成员 · ${output.participantId}`;
     if (output.status === "success" && output.content.trim()) {
-      pushGuideMessage("ai", `${label}\n${output.content}`);
+      pushGuideMessage("ai", output.content, undefined, {
+        participantId: output.participantId,
+        authorLabel,
+      });
     } else {
       const reason = output.errorMessage?.trim();
       const code = output.errorCode?.trim();
@@ -93,7 +103,10 @@ function appendGuideOutputsFallback(
           : code
           ? code
           : output.status;
-      pushGuideMessage("ai", `${label}\n⚠️ 本轮回复失败（${detail}）`);
+      pushGuideMessage("ai", `⚠️ 本轮回复失败（${detail}）`, undefined, {
+        participantId: output.participantId,
+        authorLabel,
+      });
     }
   }
 }
@@ -118,6 +131,90 @@ const PROVIDER_LABELS: Record<Provider, string> = {
   google: "Google",
   deepseek: "DeepSeek",
 };
+
+const API_DUTY_OPTIONS: Array<{ value: ApiDuty; label: string }> = [
+  { value: "developer", label: "开发者" },
+  { value: "frontend", label: "前端工程师" },
+  { value: "tester", label: "测试工程师" },
+  { value: "product_manager", label: "产品经理" },
+  { value: "mathematician", label: "数学家" },
+  { value: "researcher", label: "研究员" },
+  { value: "architect", label: "架构师" },
+  { value: "reviewer", label: "审查者" },
+];
+
+const API_DUTY_LABELS: Record<ApiDuty, string> = {
+  developer: "开发者",
+  frontend: "前端工程师",
+  tester: "测试工程师",
+  product_manager: "产品经理",
+  mathematician: "数学家",
+  researcher: "研究员",
+  architect: "架构师",
+  reviewer: "审查者",
+};
+
+const ALL_ROLES: Role[] = [
+  "proposer",
+  "critic",
+  "synthesizer",
+  "arbiter",
+  "researcher",
+  "verifier",
+];
+
+const ROLE_LABELS: Record<Role, string> = {
+  proposer: "提案",
+  critic: "质疑",
+  synthesizer: "整合",
+  arbiter: "裁决",
+  researcher: "调研",
+  verifier: "验证",
+};
+
+const DEFAULT_DUTY_ROLE_POLICY: Record<ApiDuty, Role[]> = {
+  developer: ["proposer", "synthesizer", "critic"],
+  frontend: ["proposer", "synthesizer", "critic"],
+  tester: ["verifier", "critic", "researcher"],
+  product_manager: ["proposer", "synthesizer", "arbiter"],
+  mathematician: ["verifier", "researcher", "critic"],
+  researcher: ["researcher", "critic", "verifier"],
+  architect: ["synthesizer", "arbiter", "proposer"],
+  reviewer: ["critic", "verifier", "arbiter"],
+};
+
+function rolePriorityForDuty(duty: ApiDuty): Role[] {
+  const configured = state.dutyRolePolicy[duty];
+  if (Array.isArray(configured) && configured.length > 0) {
+    return configured;
+  }
+  return DEFAULT_DUTY_ROLE_POLICY[duty] ?? ["proposer", "critic", "researcher"];
+}
+
+function roleForDuty(duty: ApiDuty): Role {
+  return rolePriorityForDuty(duty)[0] ?? "proposer";
+}
+
+function asApiDuty(value: string | undefined): ApiDuty {
+  if (!value) {
+    return "developer";
+  }
+
+  if (
+    value === "developer" ||
+    value === "frontend" ||
+    value === "tester" ||
+    value === "product_manager" ||
+    value === "mathematician" ||
+    value === "researcher" ||
+    value === "architect" ||
+    value === "reviewer"
+  ) {
+    return value;
+  }
+
+  return "developer";
+}
 
 type OpenAICompatibleTemplate = {
   id: string;
@@ -280,6 +377,42 @@ const createOfficeFlow: {
   syncState: "idle",
   syncMessage: "",
 };
+
+let profileSettingsModalOpen = false;
+const profileUserNickname = "当前用户";
+const profileUserRole = "Workspace Admin";
+
+let profileApiEditorOpen = false;
+let profileApiEditorIndex: number | null = null;
+let profileApiEditorDraft: GlobalApiConfig = createEmptyGlobalApiConfigDraft(1);
+
+function createEmptyGlobalApiConfigDraft(index: number): GlobalApiConfig {
+  return {
+    name: `接口 ${index}`,
+    duty: "developer",
+    provider: "openai",
+    modelId: "",
+    endpoint: "",
+    apiKey: "",
+  };
+}
+
+function openProfileApiEditor(index?: number): void {
+  if (typeof index === "number" && index >= 0 && index < state.globalApis.length) {
+    profileApiEditorIndex = index;
+    profileApiEditorDraft = { ...state.globalApis[index] };
+  } else {
+    profileApiEditorIndex = null;
+    profileApiEditorDraft = createEmptyGlobalApiConfigDraft(state.globalApis.length + 1);
+  }
+
+  profileApiEditorOpen = true;
+}
+
+function closeProfileApiEditor(): void {
+  profileApiEditorOpen = false;
+  profileApiEditorIndex = null;
+}
 
 type ApiKeyPanelScope = "side" | "flow";
 
@@ -571,17 +704,43 @@ function clampRounds(value: number): number {
 }
 
 function roleOptions(current: Role): string {
-  const roles: Role[] = [
-    "proposer",
-    "critic",
-    "synthesizer",
-    "arbiter",
-    "researcher",
-    "verifier",
-  ];
-  return roles
+  return ALL_ROLES
     .map((role) => `<option value="${role}" ${role === current ? "selected" : ""}>${escapeHtml(role)}</option>`)
     .join("");
+}
+
+function renderDutyRolePolicyEditor(): string {
+  const rows = API_DUTY_OPTIONS.map((duty) => {
+    const configured = rolePriorityForDuty(duty.value);
+    const roleSelects = [0, 1, 2]
+      .map((index) => {
+        const currentRole = configured[index] ?? ALL_ROLES[index] ?? "proposer";
+        const options = ALL_ROLES.map((role) => {
+          const selected = role === currentRole ? "selected" : "";
+          return `<option value="${role}" ${selected}>${escapeHtml(ROLE_LABELS[role])}</option>`;
+        }).join("");
+        return `<select data-duty-role-duty="${duty.value}" data-duty-role-rank="${index}">${options}</select>`;
+      })
+      .join("");
+
+    return `
+      <div class="duty-role-row">
+        <div class="duty-role-name">${escapeHtml(duty.label)}</div>
+        <div class="duty-role-picks">${roleSelects}</div>
+      </div>
+    `;
+  }).join("");
+
+  return `
+    <section class="profile-duty-section">
+      <div class="profile-api-head">
+        <h3 class="profile-api-title">职务映射规则</h3>
+        <button class="btn-sm" id="btn-duty-policy-reset" type="button">恢复默认</button>
+      </div>
+      <div class="duty-role-help">每个职务设置 3 个优先角色（第 1 个优先级最高）。</div>
+      <div class="duty-role-grid">${rows}</div>
+    </section>
+  `;
 }
 
 function providerOptions(current: Provider): string {
@@ -781,8 +940,121 @@ function pickProviderForRole(role: Role, available: Provider[], fallback: Provid
   return fallback;
 }
 
+function buildDesiredRolesFromApis(
+  apis: GlobalApiConfig[],
+  baseRoles: Role[],
+): Role[] {
+  const roles = [...baseRoles];
+  if (apis.length === 0) {
+    return roles;
+  }
+
+  const targetCount = Math.max(baseRoles.length, apis.length);
+  let cursor = 0;
+
+  while (roles.length < targetCount) {
+    const api = apis[cursor % apis.length];
+    cursor += 1;
+    const candidates = rolePriorityForDuty(asApiDuty(api.duty as string));
+
+    let chosen = candidates[0] ?? "proposer";
+    let minCount = Number.MAX_SAFE_INTEGER;
+    for (const candidate of candidates) {
+      const count = roles.filter((role) => role === candidate).length;
+      if (count < minCount) {
+        minCount = count;
+        chosen = candidate;
+      }
+    }
+
+    roles.push(chosen);
+  }
+
+  return roles;
+}
+
+function chooseBestApiForRole(
+  role: Role,
+  assignedIndexes: Set<number>,
+): { api: GlobalApiConfig; index: number } | undefined {
+  const candidates = state.globalApis
+    .map((api, index) => ({ api, index }))
+    .filter(({ api }) => {
+      const modelReady = api.modelId.trim().length > 0;
+      const keyReady = api.apiKey.trim().length > 0 || hasProviderKey(api.provider);
+      return modelReady && keyReady;
+    });
+
+  if (candidates.length === 0) {
+    return undefined;
+  }
+
+  const preferredUnused = candidates
+    .filter(({ index }) => !assignedIndexes.has(index))
+    .sort((left, right) => {
+      const leftPriority = rolePriorityForDuty(asApiDuty(left.api.duty as string)).indexOf(role);
+      const rightPriority = rolePriorityForDuty(asApiDuty(right.api.duty as string)).indexOf(role);
+      const normalizedLeft = leftPriority >= 0 ? leftPriority : 99;
+      const normalizedRight = rightPriority >= 0 ? rightPriority : 99;
+      return normalizedLeft - normalizedRight;
+    });
+
+  if (preferredUnused.length > 0) {
+    return preferredUnused[0];
+  }
+
+  const fallback = candidates.sort((left, right) => {
+    const leftPriority = rolePriorityForDuty(asApiDuty(left.api.duty as string)).indexOf(role);
+    const rightPriority = rolePriorityForDuty(asApiDuty(right.api.duty as string)).indexOf(role);
+    const normalizedLeft = leftPriority >= 0 ? leftPriority : 99;
+    const normalizedRight = rightPriority >= 0 ? rightPriority : 99;
+    return normalizedLeft - normalizedRight;
+  });
+
+  return fallback[0];
+}
+
 function buildFlowMembers(officeId: string): OfficeMember[] {
   const selected = getSelectedWorkflowOption();
+  const configuredApis = state.globalApis.filter((api) => {
+    const modelReady = api.modelId.trim().length > 0;
+    const keyReady = api.apiKey.trim().length > 0 || hasProviderKey(api.provider);
+    return modelReady && keyReady;
+  });
+
+  if (configuredApis.length > 0 && createOfficeFlow.providerStrategy !== "single-provider") {
+    const desiredRoles = buildDesiredRolesFromApis(configuredApis, selected.roles);
+    const assignedIndexes = new Set<number>();
+
+    return desiredRoles.map((role, index) => {
+      const chosen = chooseBestApiForRole(role, assignedIndexes) ?? {
+        api: configuredApis[index % configuredApis.length],
+        index,
+      };
+      assignedIndexes.add(chosen.index);
+
+      const provider = chosen.api.provider;
+      const modelId = chosen.api.modelId.trim() || defaultModelByProvider(provider);
+      const endpoint =
+        chosen.api.endpoint.trim() ||
+        (provider === "openai_compatible"
+          ? state.openaiCompatibleEndpoint.trim()
+          : provider === "anthropic"
+          ? state.anthropicCompatibleEndpoint.trim()
+          : "");
+
+      return {
+        participantId: `${officeId}-${role}-${index + 1}`,
+        provider,
+        modelId,
+        endpoint,
+        apiKey: chosen.api.apiKey.trim(),
+        role,
+        enabled: true,
+      };
+    });
+  }
+
   const available = getConfiguredProviders();
   const fallback = createOfficeFlow.singleProvider;
 
@@ -847,28 +1119,43 @@ function closeCreateOfficeFlow(): void {
 function buildInstantOfficeMembers(officeId: string): OfficeMember[] {
   const roles: Role[] = ["proposer", "critic", "synthesizer"];
 
-  if (hasGlobalApiConfig()) {
-    const active = getActiveGlobalApi()!;
-    const provider = active.provider;
-    const modelId = active.modelId.trim() || defaultModelByProvider(provider);
-    const endpoint =
-      active.endpoint.trim() ||
-      (provider === "openai_compatible"
-        ? state.openaiCompatibleEndpoint.trim()
-        : provider === "anthropic"
-        ? state.anthropicCompatibleEndpoint.trim()
-        : "");
-    const apiKey = active.apiKey.trim();
+  const configuredApis = state.globalApis.filter((api) => {
+    const modelReady = api.modelId.trim().length > 0;
+    const keyReady = api.apiKey.trim().length > 0 || hasProviderKey(api.provider);
+    return modelReady && keyReady;
+  });
 
-    return roles.map((role, index) => ({
-      participantId: `${officeId}-${role}-${index + 1}`,
-      provider,
-      modelId,
-      endpoint,
-      apiKey,
-      role,
-      enabled: true,
-    }));
+  if (configuredApis.length > 0) {
+    const rolePool = buildDesiredRolesFromApis(configuredApis, roles);
+    const assignedIndexes = new Set<number>();
+
+    return rolePool.map((role, index) => {
+      const chosen = chooseBestApiForRole(role, assignedIndexes) ?? {
+        api: configuredApis[index % configuredApis.length],
+        index,
+      };
+      assignedIndexes.add(chosen.index);
+
+      const provider = chosen.api.provider;
+      const modelId = chosen.api.modelId.trim() || defaultModelByProvider(provider);
+      const endpoint =
+        chosen.api.endpoint.trim() ||
+        (provider === "openai_compatible"
+          ? state.openaiCompatibleEndpoint.trim()
+          : provider === "anthropic"
+          ? state.anthropicCompatibleEndpoint.trim()
+          : "");
+
+      return {
+        participantId: `${officeId}-${role}-${index + 1}`,
+        provider,
+        modelId,
+        endpoint,
+        apiKey: chosen.api.apiKey.trim(),
+        role,
+        enabled: true,
+      };
+    });
   }
 
   const available = getConfiguredProviders();
@@ -1357,78 +1644,145 @@ function renderSubscriptionView(): string {
   `;
 }
 
-function renderGlobalApiCard(api: GlobalApiConfig, index: number): string {
+function renderProfileApiCard(api: GlobalApiConfig, index: number): string {
   const isActive = index === state.activeGlobalApiIndex;
-  const providerOptionsHtml = ALL_PROVIDERS.map(
-    (provider) =>
-      `<option value="${provider}" ${api.provider === provider ? "selected" : ""}>${escapeHtml(
-        PROVIDER_LABELS[provider],
-      )}</option>`,
-  ).join("");
+  const providerLabel = PROVIDER_LABELS[api.provider] ?? api.provider;
+  const modelId = api.modelId.trim() || "未填写 Model ID";
+  const keyState = api.apiKey.trim()
+    ? "已填写 Key"
+    : hasProviderKey(api.provider)
+    ? "使用全局 Key"
+    : "未配置 Key";
 
   return `
-    <div class="dash-section global-api-card ${isActive ? "global-api-card-active" : ""}" data-global-api-index="${index}">
-      <div class="global-api-card-header">
-        <label class="field" style="flex:1;margin-bottom:0">
-          <span>名称</span>
-          <input class="global-api-name" data-index="${index}" value="${escapeHtml(api.name)}" placeholder="接口名称" />
-        </label>
-        <div class="global-api-card-actions">
-          ${isActive ? '<span class="badge badge-active">当前使用</span>' : `<button class="btn-sm global-api-activate" data-index="${index}">设为当前</button>`}
-          <button class="btn-sm btn-danger global-api-remove" data-index="${index}" ${state.globalApis.length <= 1 ? "disabled" : ""}>删除</button>
-        </div>
+    <div class="profile-api-card ${isActive ? "global-api-card-active" : ""}">
+      <div class="profile-api-main">
+        <div class="profile-api-name">${escapeHtml(api.name.trim() || `接口 ${index + 1}`)}</div>
+        <div class="profile-api-meta">${escapeHtml(API_DUTY_LABELS[asApiDuty(api.duty as string)])} · ${escapeHtml(providerLabel)} · ${escapeHtml(modelId)} · ${escapeHtml(keyState)}</div>
       </div>
-      <label class="field">
-        <span>Provider</span>
-        <select class="global-api-provider" data-index="${index}">${providerOptionsHtml}</select>
-      </label>
-      <label class="field">
-        <span>Model ID</span>
-        <input class="global-api-model" data-index="${index}" value="${escapeHtml(api.modelId)}" placeholder="例如：gpt-4.1" />
-      </label>
-      <label class="field">
-        <span>Endpoint（可选）</span>
-        <input class="global-api-endpoint" data-index="${index}" value="${escapeHtml(api.endpoint)}" placeholder="例如：https://api.openai.com/v1 或 .../v1/chat/completions" />
-      </label>
-      <label class="field">
-        <span>API Key（可选）</span>
-        <input class="global-api-key" data-index="${index}" value="${escapeHtml(api.apiKey)}" placeholder="sk-..." />
-      </label>
+      <div class="profile-api-actions">
+        ${isActive
+          ? '<span class="badge badge-active">秘书分身</span>'
+          : `<button class="btn-sm profile-api-activate" data-index="${index}" type="button">设为我的分身（秘书）</button>`}
+        <button class="btn-sm profile-api-edit" data-index="${index}" type="button">配置</button>
+        <button class="btn-sm btn-danger profile-api-remove" data-index="${index}" type="button">删除</button>
+      </div>
     </div>
   `;
 }
 
-function renderSettingsView(): string {
-  const apiCards = state.globalApis.map((api, index) => renderGlobalApiCard(api, index)).join("");
+function renderProfileApiEditorModal(): string {
+  if (!profileSettingsModalOpen || !profileApiEditorOpen) {
+    return "";
+  }
+
+  const providerOptionsHtml = ALL_PROVIDERS.map(
+    (provider) =>
+      `<option value="${provider}" ${profileApiEditorDraft.provider === provider ? "selected" : ""}>${escapeHtml(
+        PROVIDER_LABELS[provider],
+      )}</option>`,
+  ).join("");
+  const dutyOptionsHtml = API_DUTY_OPTIONS.map(
+    (option) =>
+      `<option value="${option.value}" ${asApiDuty(profileApiEditorDraft.duty as string) === option.value ? "selected" : ""}>${escapeHtml(option.label)}</option>`,
+  ).join("");
+  const saveLabel = profileApiEditorIndex === null ? "添加 API" : "保存 API";
 
   return `
-    <div class="subscription-view">
-      <h2 class="view-title">设置</h2>
-      <p class="view-desc">全局 API 接口配置：可配置多个接口，统一维护并导入到办公室成员</p>
+    <div class="flow-modal-mask profile-api-editor-mask" id="profile-api-editor-mask">
+      <div class="flow-modal profile-api-editor-modal">
+        <div class="flow-modal-head">
+          <div>
+            <div class="flow-modal-title">配置 API</div>
+            <div class="flow-modal-sub">填写 Provider、Model、Endpoint 与 Key。</div>
+          </div>
+          <button id="btn-profile-api-editor-close" type="button">关闭</button>
+        </div>
 
-      <div class="global-api-list">
-        ${apiCards}
-      </div>
+        <div class="flow-modal-body profile-api-editor-body">
+          <label class="field">
+            <span>名称</span>
+            <input id="profile-api-editor-name" value="${escapeHtml(profileApiEditorDraft.name)}" placeholder="接口名称" />
+          </label>
+          <label class="field">
+            <span>Provider</span>
+            <select id="profile-api-editor-provider">${providerOptionsHtml}</select>
+          </label>
+          <label class="field">
+            <span>职务</span>
+            <select id="profile-api-editor-duty">${dutyOptionsHtml}</select>
+          </label>
+          <label class="field">
+            <span>Model ID</span>
+            <input id="profile-api-editor-model" value="${escapeHtml(profileApiEditorDraft.modelId)}" placeholder="例如：gpt-4.1" />
+          </label>
+          <label class="field">
+            <span>Endpoint（可选）</span>
+            <input id="profile-api-editor-endpoint" value="${escapeHtml(profileApiEditorDraft.endpoint)}" placeholder="例如：https://api.openai.com/v1" />
+          </label>
+          <label class="field">
+            <span>API Key（可选）</span>
+            <input id="profile-api-editor-key" value="${escapeHtml(profileApiEditorDraft.apiKey)}" placeholder="sk-..." />
+          </label>
+        </div>
 
-      <div class="actions" style="margin-bottom:16px">
-        <button id="btn-settings-add-global">＋ 添加接口</button>
-      </div>
-
-      <div class="dash-section">
-        <h3>JSON 导入</h3>
-        <label class="field">
-          <span>粘贴 JSON（单个或数组）</span>
-          <textarea id="settings-global-import" rows="6" placeholder='{"name":"我的接口","provider":"openai","modelId":"gpt-4.1","endpoint":"","apiKey":""}&#10;或 [{"name":"接口1",...},{"name":"接口2",...}]'>${escapeHtml(
-            state.globalApiImportText,
-          )}</textarea>
-        </label>
-        <div class="actions">
-          <button id="btn-settings-import-global">从 JSON 导入</button>
-          <button id="btn-settings-apply-global-office">导入当前接口到办公室成员</button>
-          <button id="btn-settings-sync-global">同步全局 Keys 到引擎</button>
+        <div class="flow-modal-foot">
+          <button id="btn-profile-api-editor-cancel" type="button">取消</button>
+          <button id="btn-profile-api-editor-save" type="button">${saveLabel}</button>
         </div>
       </div>
     </div>
+  `;
+}
+
+function renderProfileSettingsModal(): string {
+  if (!profileSettingsModalOpen) {
+    return "";
+  }
+
+  const apiSectionHtml =
+    state.globalApis.length > 0
+      ? `
+        <div class="profile-api-list">
+          ${state.globalApis.map((api, index) => renderProfileApiCard(api, index)).join("")}
+        </div>
+      `
+      : `
+        <div class="profile-api-empty">
+          <button class="profile-api-empty-add" id="btn-profile-api-add-empty" type="button">＋</button>
+        </div>
+      `;
+
+  return `
+    <div class="flow-modal-mask profile-settings-mask" id="profile-settings-mask">
+      <div class="flow-modal profile-settings-modal">
+        <div class="flow-modal-head">
+          <div>
+            <div class="flow-modal-title">用户中心</div>
+          </div>
+          <button id="btn-profile-settings-close" type="button">关闭</button>
+        </div>
+
+        <div class="flow-modal-body profile-settings-body">
+          <section class="profile-user-card">
+            <span class="profile-user-avatar">U</span>
+            <div class="profile-user-name">${escapeHtml(profileUserNickname)}</div>
+            <div class="profile-user-role">${escapeHtml(profileUserRole)}</div>
+          </section>
+
+          <section class="profile-api-section">
+            <div class="profile-api-head">
+              <h3 class="profile-api-title">我的 API</h3>
+              <button class="profile-api-add-btn" id="btn-profile-api-add" type="button">＋</button>
+            </div>
+            ${apiSectionHtml}
+          </section>
+
+          ${renderDutyRolePolicyEditor()}
+        </div>
+      </div>
+    </div>
+    ${renderProfileApiEditorModal()}
   `;
 }
 
@@ -1441,7 +1795,12 @@ function renderGuideModal(): string {
     .map((message) => {
       const cls = message.sender === "ai" ? "guide-msg-ai" : message.sender === "user" ? "guide-msg-user" : "guide-msg-system";
       const roleIcon = message.sender === "ai" ? "🤖" : message.sender === "user" ? "👤" : "⚙️";
-      const roleLabel = message.sender === "ai" ? "AI" : message.sender === "user" ? "你" : "系统";
+      const roleLabel =
+        message.sender === "ai"
+          ? message.authorLabel ?? "AI"
+          : message.sender === "user"
+          ? "你"
+          : "系统";
       // AI 消息使用 Markdown 渲染，用户消息保持纯文本
       const bodyHtml = message.sender === "ai"
         ? `<div class="guide-msg-text md-body">${renderMarkdown(message.text)}</div>`
@@ -1458,7 +1817,7 @@ function renderGuideModal(): string {
   // AI 思考中的动画指示器
   const thinkingIndicator = guideFlow.aiThinking
     ? `<div class="guide-msg guide-msg-ai guide-thinking">
-        <div class="guide-msg-role">🤖 AI</div>
+        <div class="guide-msg-role">🤖 AI 群聊（正在产出讨论路径）</div>
         <div class="guide-msg-text">
           <div class="thinking-indicator">
             <div class="thinking-dots">
@@ -1466,7 +1825,7 @@ function renderGuideModal(): string {
               <span class="thinking-dot"></span>
               <span class="thinking-dot"></span>
             </div>
-            <span class="thinking-label">AI 正在思考...</span>
+            <span class="thinking-label">AI 正在输出讨论过程，请看上方实时气泡…</span>
           </div>
         </div>
       </div>`
@@ -1475,6 +1834,9 @@ function renderGuideModal(): string {
   const canSend = guideFlow.userInput.trim().length > 0 && !guideFlow.aiThinking && !guideFlow.creating;
   const sendLabel = guideFlow.aiThinking ? "AI 思考中..." : "继续讨论";
   const createLabel = guideFlow.creating ? "创建中..." : "按这个想法创建办公室";
+  const delegateLabel = guideFlow.secretaryCanFinalize
+    ? "已授权秘书代拍"
+    : "授权秘书代拍（需明确授权）";
 
   return `
     <div class="flow-modal-mask">
@@ -1489,6 +1851,11 @@ function renderGuideModal(): string {
 
         <div class="flow-modal-body">
           <div class="guide-thread">${messages}${thinkingIndicator}</div>
+
+          <label class="field guide-secretary-toggle">
+            <input id="guide-secretary-delegate" type="checkbox" ${guideFlow.secretaryCanFinalize ? "checked" : ""} />
+            <span>${delegateLabel}</span>
+          </label>
 
           <label class="field">
             <span>你的想法</span>
@@ -1531,7 +1898,7 @@ function navLabel(mode: WorkspaceMode): string {
   return map[mode] ?? mode;
 }
 
-const navModes: WorkspaceMode[] = ["offices", "dashboard", "subscription", "settings"];
+const navModes: WorkspaceMode[] = ["offices", "dashboard", "subscription"];
 
 function renderCenterContent(): string {
   switch (state.workspaceMode) {
@@ -1539,8 +1906,6 @@ function renderCenterContent(): string {
       return renderDashboardView();
     case "subscription":
       return renderSubscriptionView();
-    case "settings":
-      return renderSettingsView();
     case "offices":
     default:
       return `<div class="grid">${renderOfficeCards()}</div>`;
@@ -1793,7 +2158,7 @@ export function render(): void {
             ${navItems}
           </div>
           <div class="nav-bottom">
-            <div class="profile">
+            <div class="profile profile-trigger" id="btn-profile-settings" role="button" tabindex="0">
               <span class="profile-avatar">U</span>
               <div class="profile-copy">
                 <span class="profile-name">当前用户</span>
@@ -1811,6 +2176,7 @@ export function render(): void {
       </div>
     </div>
     ${renderCreateOfficeModal()}
+    ${renderProfileSettingsModal()}
     ${renderGuideModal()}
     ${renderToasts()}
   `;
@@ -1831,6 +2197,225 @@ function bindEvents(office: OfficeDraft | undefined): void {
         render();
       }
     });
+  });
+
+  const profileSettingsTrigger = app.querySelector<HTMLElement>("#btn-profile-settings");
+  profileSettingsTrigger?.addEventListener("click", () => {
+    profileSettingsModalOpen = true;
+    render();
+  });
+
+  profileSettingsTrigger?.addEventListener("keydown", (event) => {
+    if (event.key !== "Enter" && event.key !== " ") {
+      return;
+    }
+
+    event.preventDefault();
+    profileSettingsModalOpen = true;
+    render();
+  });
+
+  app.querySelector<HTMLButtonElement>("#btn-profile-settings-close")?.addEventListener("click", () => {
+    closeProfileApiEditor();
+    profileSettingsModalOpen = false;
+    render();
+  });
+
+  app.querySelector<HTMLDivElement>("#profile-settings-mask")?.addEventListener("click", (event) => {
+    if (event.target !== event.currentTarget) {
+      return;
+    }
+
+    closeProfileApiEditor();
+    profileSettingsModalOpen = false;
+    render();
+  });
+
+  const openProfileApiCreate = () => {
+    openProfileApiEditor();
+    render();
+  };
+
+  app.querySelector<HTMLButtonElement>("#btn-profile-api-add")?.addEventListener("click", openProfileApiCreate);
+  app.querySelector<HTMLButtonElement>("#btn-profile-api-add-empty")?.addEventListener("click", openProfileApiCreate);
+
+  app.querySelectorAll<HTMLButtonElement>(".profile-api-edit").forEach((button) => {
+    button.addEventListener("click", () => {
+      const index = Number(button.dataset.index);
+      if (!Number.isInteger(index) || index < 0 || index >= state.globalApis.length) {
+        return;
+      }
+      openProfileApiEditor(index);
+      render();
+    });
+  });
+
+  app.querySelectorAll<HTMLButtonElement>(".profile-api-activate").forEach((button) => {
+    button.addEventListener("click", () => {
+      const index = Number(button.dataset.index);
+      if (!Number.isInteger(index) || index < 0 || index >= state.globalApis.length) {
+        return;
+      }
+
+      state.activeGlobalApiIndex = index;
+      toast(`已将「${state.globalApis[index].name || `接口 ${index + 1}`}」设为你的分身（秘书）`, "success");
+      render();
+    });
+  });
+
+  app.querySelectorAll<HTMLButtonElement>(".profile-api-remove").forEach((button) => {
+    button.addEventListener("click", () => {
+      const index = Number(button.dataset.index);
+      if (!Number.isInteger(index) || index < 0 || index >= state.globalApis.length) {
+        return;
+      }
+
+      state.globalApis.splice(index, 1);
+      if (state.globalApis.length === 0) {
+        state.activeGlobalApiIndex = 0;
+      } else if (state.activeGlobalApiIndex >= state.globalApis.length) {
+        state.activeGlobalApiIndex = state.globalApis.length - 1;
+      } else if (state.activeGlobalApiIndex > index) {
+        state.activeGlobalApiIndex -= 1;
+      }
+
+      toast("接口已删除", "success");
+      render();
+    });
+  });
+
+  app.querySelector<HTMLButtonElement>("#btn-profile-api-editor-close")?.addEventListener("click", () => {
+    closeProfileApiEditor();
+    render();
+  });
+
+  app.querySelector<HTMLButtonElement>("#btn-profile-api-editor-cancel")?.addEventListener("click", () => {
+    closeProfileApiEditor();
+    render();
+  });
+
+  app.querySelector<HTMLDivElement>("#profile-api-editor-mask")?.addEventListener("click", (event) => {
+    if (event.target !== event.currentTarget) {
+      return;
+    }
+
+    // 禁用点击遮罩关闭：仅允许通过“关闭/取消”按钮关闭配置 API 弹窗
+    event.stopPropagation();
+  });
+
+  app.querySelector<HTMLInputElement>("#profile-api-editor-name")?.addEventListener("input", (event) => {
+    const target = event.currentTarget as HTMLInputElement;
+    profileApiEditorDraft.name = target.value;
+  });
+
+  app.querySelector<HTMLSelectElement>("#profile-api-editor-provider")?.addEventListener("change", (event) => {
+    const target = event.currentTarget as HTMLSelectElement;
+    const provider = asProvider(target.value);
+    if (!provider) {
+      return;
+    }
+    profileApiEditorDraft.provider = provider;
+  });
+
+  app.querySelector<HTMLSelectElement>("#profile-api-editor-duty")?.addEventListener("change", (event) => {
+    const target = event.currentTarget as HTMLSelectElement;
+    profileApiEditorDraft.duty = asApiDuty(target.value);
+  });
+
+  app.querySelector<HTMLInputElement>("#profile-api-editor-model")?.addEventListener("input", (event) => {
+    const target = event.currentTarget as HTMLInputElement;
+    profileApiEditorDraft.modelId = target.value;
+  });
+
+  app.querySelector<HTMLInputElement>("#profile-api-editor-endpoint")?.addEventListener("input", (event) => {
+    const target = event.currentTarget as HTMLInputElement;
+    profileApiEditorDraft.endpoint = target.value;
+  });
+
+  app.querySelector<HTMLInputElement>("#profile-api-editor-key")?.addEventListener("input", (event) => {
+    const target = event.currentTarget as HTMLInputElement;
+    profileApiEditorDraft.apiKey = target.value;
+  });
+
+  app.querySelector<HTMLButtonElement>("#btn-profile-api-editor-save")?.addEventListener("click", () => {
+    const next: GlobalApiConfig = {
+      name: profileApiEditorDraft.name.trim() || `接口 ${state.globalApis.length + 1}`,
+      duty: asApiDuty(profileApiEditorDraft.duty as string),
+      provider: profileApiEditorDraft.provider,
+      modelId: profileApiEditorDraft.modelId.trim(),
+      endpoint: profileApiEditorDraft.endpoint.trim(),
+      apiKey: profileApiEditorDraft.apiKey.trim(),
+    };
+
+    if (!next.modelId) {
+      toast("请先填写 Model ID", "error");
+      return;
+    }
+
+    if (profileApiEditorIndex === null) {
+      state.globalApis.push(next);
+      state.activeGlobalApiIndex = state.globalApis.length - 1;
+      toast("已添加 API 配置", "success");
+    } else {
+      state.globalApis[profileApiEditorIndex] = next;
+      toast("已保存 API 配置", "success");
+    }
+
+    closeProfileApiEditor();
+    render();
+  });
+
+  app.querySelectorAll<HTMLSelectElement>("[data-duty-role-duty][data-duty-role-rank]").forEach((select) => {
+    select.addEventListener("change", () => {
+      const duty = asApiDuty(select.dataset.dutyRoleDuty);
+      const rank = Number(select.dataset.dutyRoleRank);
+      if (!Number.isInteger(rank) || rank < 0) {
+        return;
+      }
+
+      const nextRole = select.value as Role;
+      if (!ALL_ROLES.includes(nextRole)) {
+        return;
+      }
+
+      const current = [...rolePriorityForDuty(duty)];
+      while (current.length < 3) {
+        current.push(ALL_ROLES[current.length] ?? "proposer");
+      }
+
+      current.splice(rank, 1);
+      current.unshift(nextRole);
+
+      const deduped: Role[] = [];
+      for (const role of current) {
+        if (!deduped.includes(role)) {
+          deduped.push(role);
+        }
+      }
+      for (const role of ALL_ROLES) {
+        if (!deduped.includes(role)) {
+          deduped.push(role);
+        }
+      }
+
+      state.dutyRolePolicy[duty] = deduped.slice(0, 3);
+      render();
+    });
+  });
+
+  app.querySelector<HTMLButtonElement>("#btn-duty-policy-reset")?.addEventListener("click", () => {
+    state.dutyRolePolicy = {
+      developer: [...DEFAULT_DUTY_ROLE_POLICY.developer],
+      frontend: [...DEFAULT_DUTY_ROLE_POLICY.frontend],
+      tester: [...DEFAULT_DUTY_ROLE_POLICY.tester],
+      product_manager: [...DEFAULT_DUTY_ROLE_POLICY.product_manager],
+      mathematician: [...DEFAULT_DUTY_ROLE_POLICY.mathematician],
+      researcher: [...DEFAULT_DUTY_ROLE_POLICY.researcher],
+      architect: [...DEFAULT_DUTY_ROLE_POLICY.architect],
+      reviewer: [...DEFAULT_DUTY_ROLE_POLICY.reviewer],
+    };
+    toast("已恢复默认职务映射规则", "success");
+    render();
   });
 
   // 订阅页 tab 切换
@@ -1860,7 +2445,7 @@ function bindEvents(office: OfficeDraft | undefined): void {
 
     if (!hasAnyConfiguredKey()) {
       openCreateOfficeFlow();
-      toast("请先在“设置”里配置全局 API（或先同步 Key）后再一键开聊。", "info");
+      toast("请先点击左下角“当前用户”，在“系统设置”里配置全局 API（或先同步 Key）后再一键开聊。", "info");
       render();
       return;
     }
@@ -1884,6 +2469,12 @@ function bindEvents(office: OfficeDraft | undefined): void {
     if (sendBtn) {
       sendBtn.disabled = !canSend;
     }
+  });
+
+  app.querySelector<HTMLInputElement>("#guide-secretary-delegate")?.addEventListener("change", (event) => {
+    const target = event.currentTarget as HTMLInputElement;
+    guideFlow.secretaryCanFinalize = target.checked;
+    render();
   });
 
   const sendGuideMessage = async () => {
@@ -1977,195 +2568,6 @@ function bindEvents(office: OfficeDraft | undefined): void {
   app.querySelector<HTMLButtonElement>("#btn-flow-cancel")?.addEventListener("click", () => {
     closeCreateOfficeFlow();
     render();
-  });
-
-  // ─── 多个全局 API 接口卡片事件 ───
-
-  app.querySelectorAll<HTMLInputElement>(".global-api-name").forEach((input) => {
-    input.addEventListener("input", (event) => {
-      const target = event.currentTarget as HTMLInputElement;
-      const index = Number(target.dataset.index);
-      if (state.globalApis[index]) {
-        state.globalApis[index].name = target.value;
-      }
-    });
-  });
-
-  app.querySelectorAll<HTMLSelectElement>(".global-api-provider").forEach((select) => {
-    select.addEventListener("change", (event) => {
-      const target = event.currentTarget as HTMLSelectElement;
-      const index = Number(target.dataset.index);
-      const provider = target.value as Provider;
-      if (state.globalApis[index] && ALL_PROVIDERS.includes(provider)) {
-        state.globalApis[index].provider = provider;
-      }
-    });
-  });
-
-  app.querySelectorAll<HTMLInputElement>(".global-api-model").forEach((input) => {
-    input.addEventListener("input", (event) => {
-      const target = event.currentTarget as HTMLInputElement;
-      const index = Number(target.dataset.index);
-      if (state.globalApis[index]) {
-        state.globalApis[index].modelId = target.value;
-      }
-    });
-  });
-
-  app.querySelectorAll<HTMLInputElement>(".global-api-endpoint").forEach((input) => {
-    input.addEventListener("input", (event) => {
-      const target = event.currentTarget as HTMLInputElement;
-      const index = Number(target.dataset.index);
-      if (state.globalApis[index]) {
-        state.globalApis[index].endpoint = target.value;
-      }
-    });
-  });
-
-  app.querySelectorAll<HTMLInputElement>(".global-api-key").forEach((input) => {
-    input.addEventListener("input", (event) => {
-      const target = event.currentTarget as HTMLInputElement;
-      const index = Number(target.dataset.index);
-      if (state.globalApis[index]) {
-        state.globalApis[index].apiKey = target.value;
-      }
-    });
-  });
-
-  app.querySelectorAll<HTMLButtonElement>(".global-api-activate").forEach((button) => {
-    button.addEventListener("click", () => {
-      const index = Number(button.dataset.index);
-      if (index >= 0 && index < state.globalApis.length) {
-        state.activeGlobalApiIndex = index;
-        toast(`已切换到「${state.globalApis[index].name || "接口 " + (index + 1)}」`, "success");
-        render();
-      }
-    });
-  });
-
-  app.querySelectorAll<HTMLButtonElement>(".global-api-remove").forEach((button) => {
-    button.addEventListener("click", () => {
-      const index = Number(button.dataset.index);
-      if (state.globalApis.length <= 1) {
-        toast("至少保留一个接口配置", "error");
-        return;
-      }
-      state.globalApis.splice(index, 1);
-      if (state.activeGlobalApiIndex >= state.globalApis.length) {
-        state.activeGlobalApiIndex = state.globalApis.length - 1;
-      } else if (state.activeGlobalApiIndex > index) {
-        state.activeGlobalApiIndex -= 1;
-      }
-      toast("接口已删除", "success");
-      render();
-    });
-  });
-
-  app.querySelector<HTMLButtonElement>("#btn-settings-add-global")?.addEventListener("click", () => {
-    const newIndex = state.globalApis.length + 1;
-    state.globalApis.push({
-      name: `接口 ${newIndex}`,
-      provider: "openai",
-      modelId: "",
-      endpoint: "",
-      apiKey: "",
-    });
-    toast("已添加新接口配置", "success");
-    render();
-  });
-
-  app.querySelector<HTMLTextAreaElement>("#settings-global-import")?.addEventListener("input", (event) => {
-    const target = event.currentTarget as HTMLTextAreaElement;
-    state.globalApiImportText = target.value;
-  });
-
-  app.querySelector<HTMLButtonElement>("#btn-settings-import-global")?.addEventListener("click", () => {
-    const text = state.globalApiImportText.trim();
-    if (!text) {
-      toast("请先粘贴 JSON", "error");
-      return;
-    }
-
-    try {
-      const raw = JSON.parse(text);
-      const items: Array<Partial<GlobalApiConfig>> = Array.isArray(raw) ? raw : [raw];
-      let importedCount = 0;
-
-      for (const parsed of items) {
-        const provider = parsed.provider && ALL_PROVIDERS.includes(parsed.provider) ? parsed.provider : "openai";
-        const entry: GlobalApiConfig = {
-          name: typeof parsed.name === "string" ? parsed.name : `导入接口 ${state.globalApis.length + 1}`,
-          provider,
-          modelId: typeof parsed.modelId === "string" ? parsed.modelId : "",
-          endpoint: typeof parsed.endpoint === "string" ? parsed.endpoint : "",
-          apiKey: typeof parsed.apiKey === "string" ? parsed.apiKey : "",
-        };
-        state.globalApis.push(entry);
-        importedCount += 1;
-      }
-
-      toast(`已导入 ${importedCount} 个接口配置`, "success");
-      render();
-    } catch {
-      toast("JSON 解析失败", "error");
-    }
-  });
-
-  app.querySelector<HTMLButtonElement>("#btn-settings-apply-global-office")?.addEventListener("click", () => {
-    const activeOffice = getActiveOffice();
-    if (!activeOffice) {
-      toast("当前没有可导入的办公室", "error");
-      return;
-    }
-
-    const active = getActiveGlobalApi();
-    if (!active) {
-      toast("没有可用的全局接口配置", "error");
-      return;
-    }
-
-    const modelId = active.modelId.trim();
-    if (!modelId) {
-      toast("请先填写当前接口的 Model ID", "error");
-      return;
-    }
-
-    const endpoint = active.endpoint.trim();
-    const apiKey = active.apiKey.trim();
-
-    activeOffice.members.forEach((member) => {
-      member.provider = active.provider;
-      member.modelId = modelId;
-      member.endpoint = endpoint;
-      member.apiKey = apiKey;
-    });
-
-    if (apiKey) {
-      state.apiKeys[active.provider] = apiKey;
-    }
-
-    toast(`已将「${active.name}」导入到当前办公室成员`, "success");
-    render();
-  });
-
-  app.querySelector<HTMLButtonElement>("#btn-settings-sync-global")?.addEventListener("click", async () => {
-    // 将所有全局接口的 key 同步到 apiKeys
-    for (const api of state.globalApis) {
-      const key = api.apiKey.trim();
-      if (key) {
-        state.apiKeys[api.provider] = key;
-      }
-    }
-
-    setBusyAction("syncing-keys");
-    render();
-    try {
-      const result = await syncKeysWithEngine();
-      toast(result.message, result.ok ? "success" : "error");
-    } finally {
-      setBusyAction("none");
-      render();
-    }
   });
 
   app.querySelectorAll<HTMLButtonElement>("[data-api-provider-add]").forEach((button) => {
@@ -3112,6 +3514,18 @@ export function mountStyles(): void {
       overflow: auto;
       display: grid;
       gap: 8px;
+    }
+    .guide-secretary-toggle {
+      margin-top: 10px;
+      display: flex;
+      align-items: center;
+      gap: 8px;
+      font-size: 12px;
+      color: #3b4f73;
+    }
+    .guide-secretary-toggle input {
+      width: 14px;
+      height: 14px;
     }
     .guide-msg {
       border-radius: 10px;
@@ -4380,6 +4794,18 @@ export function mountStyles(): void {
       display: grid;
       gap: 8px;
     }
+    .guide-secretary-toggle {
+      margin-top: 10px;
+      display: flex;
+      align-items: center;
+      gap: 8px;
+      font-size: 12px;
+      color: #6b4a27;
+    }
+    .guide-secretary-toggle input {
+      width: 14px;
+      height: 14px;
+    }
     .guide-msg {
       border: 1px solid #e0d2bc;
       border-radius: 10px;
@@ -5300,6 +5726,192 @@ export function mountStyles(): void {
       color: #111827;
       font-size: 20px;
     }
+    .profile-trigger {
+      width: 100%;
+      text-align: left;
+      cursor: pointer;
+    }
+    .profile-settings-mask {
+      z-index: 900;
+    }
+    .profile-settings-modal {
+      width: min(920px, calc(100vw - 32px));
+    }
+    .profile-settings-body {
+      display: grid;
+      gap: 14px;
+      max-height: calc(100vh - 190px);
+      overflow: auto;
+    }
+    .profile-user-card {
+      border: 1px solid var(--line);
+      border-radius: 12px;
+      background: #ffffff;
+      padding: 20px 16px;
+      display: grid;
+      justify-items: center;
+      gap: 8px;
+      text-align: center;
+    }
+    .profile-user-avatar {
+      width: 72px;
+      height: 72px;
+      border-radius: 999px;
+      display: grid;
+      place-items: center;
+      background: #fff7e6;
+      color: #92400e;
+      border: 1px solid #f2c572;
+      font-size: 28px;
+      font-weight: 700;
+    }
+    .profile-user-name {
+      font-size: 18px;
+      color: #111827;
+      font-weight: 700;
+    }
+    .profile-user-role {
+      color: #64748b;
+      font-size: 12px;
+    }
+    .profile-api-section {
+      border: 1px solid var(--line);
+      border-radius: 12px;
+      background: #ffffff;
+      padding: 12px;
+      display: grid;
+      gap: 10px;
+    }
+    .profile-duty-section {
+      border: 1px solid var(--line);
+      border-radius: 12px;
+      background: #ffffff;
+      padding: 12px;
+      display: grid;
+      gap: 10px;
+    }
+    .duty-role-help {
+      color: #64748b;
+      font-size: 12px;
+    }
+    .duty-role-grid {
+      display: grid;
+      gap: 8px;
+    }
+    .duty-role-row {
+      border: 1px solid var(--line);
+      border-radius: 10px;
+      padding: 8px;
+      display: grid;
+      gap: 8px;
+    }
+    .duty-role-name {
+      color: #0f172a;
+      font-size: 13px;
+      font-weight: 700;
+    }
+    .duty-role-picks {
+      display: grid;
+      grid-template-columns: repeat(3, minmax(0, 1fr));
+      gap: 8px;
+    }
+    .duty-role-picks select {
+      width: 100%;
+      font-size: 12px;
+      border-radius: 8px;
+      padding: 6px 8px;
+    }
+    .profile-api-head {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      gap: 10px;
+    }
+    .profile-api-title {
+      margin: 0;
+      color: #0f172a;
+      font-size: 16px;
+      font-weight: 700;
+    }
+    .profile-api-add-btn,
+    .profile-api-empty-add {
+      width: 34px;
+      height: 34px;
+      border-radius: 10px;
+      padding: 0;
+      font-size: 22px;
+      line-height: 1;
+      border-color: var(--accent-strong);
+      background: var(--accent);
+      color: #ffffff;
+      display: inline-grid;
+      place-items: center;
+    }
+    .profile-api-add-btn:hover,
+    .profile-api-empty-add:hover {
+      border-color: #b45309;
+      background: #d97706;
+    }
+    .profile-api-list {
+      display: grid;
+      gap: 8px;
+    }
+    .profile-api-card {
+      border: 1px solid var(--line);
+      border-radius: 10px;
+      background: #ffffff;
+      padding: 10px;
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      gap: 12px;
+    }
+    .profile-api-main {
+      min-width: 0;
+      display: grid;
+      gap: 4px;
+    }
+    .profile-api-name {
+      color: #0f172a;
+      font-size: 14px;
+      font-weight: 700;
+    }
+    .profile-api-meta {
+      color: #64748b;
+      font-size: 12px;
+      white-space: nowrap;
+      overflow: hidden;
+      text-overflow: ellipsis;
+      max-width: 560px;
+    }
+    .profile-api-actions {
+      display: inline-flex;
+      align-items: center;
+      gap: 8px;
+      flex-wrap: wrap;
+      justify-content: flex-end;
+    }
+    .profile-api-empty {
+      border: 1px dashed var(--line-strong);
+      border-radius: 12px;
+      background: #fffdfa;
+      min-height: 84px;
+      display: grid;
+      place-items: center;
+      padding: 12px;
+      text-align: center;
+    }
+    .profile-api-editor-mask {
+      z-index: 920;
+      background: rgba(15, 23, 42, 0.5);
+    }
+    .profile-api-editor-modal {
+      width: min(620px, calc(100vw - 32px));
+    }
+    .profile-api-editor-body {
+      max-height: calc(100vh - 210px);
+      overflow: auto;
+    }
 
     .global-api-card-active {
       border-color: #f2c572;
@@ -5397,6 +6009,17 @@ export function mountStyles(): void {
       .sub-chunk-head {
         flex-direction: column;
         align-items: flex-start;
+      }
+      .profile-api-card {
+        flex-direction: column;
+        align-items: flex-start;
+      }
+      .profile-api-actions {
+        width: 100%;
+        justify-content: flex-start;
+      }
+      .duty-role-picks {
+        grid-template-columns: 1fr;
       }
     }
   `;

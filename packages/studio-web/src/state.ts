@@ -103,12 +103,23 @@ export const state: DashboardState = {
   globalApis: [
     {
       name: "默认接口",
+      duty: "developer",
       provider: "openai",
       modelId: "gpt-4.1",
       endpoint: "",
       apiKey: "",
     },
   ],
+  dutyRolePolicy: {
+    developer: ["proposer", "synthesizer", "critic"],
+    frontend: ["proposer", "synthesizer", "critic"],
+    tester: ["verifier", "critic", "researcher"],
+    product_manager: ["proposer", "synthesizer", "arbiter"],
+    mathematician: ["verifier", "researcher", "critic"],
+    researcher: ["researcher", "critic", "verifier"],
+    architect: ["synthesizer", "arbiter", "proposer"],
+    reviewer: ["critic", "verifier", "arbiter"],
+  },
   activeGlobalApiIndex: 0,
   globalApiImportText: "",
   openaiCompatibleEndpoint: "",
@@ -280,6 +291,9 @@ export const guideFlow: GuideFlowState = {
   open: false,
   phase: "greeting",
   messages: [],
+  participantLabels: {},
+  leaderParticipantId: "",
+  secretaryCanFinalize: false,
   userInput: "",
   confirmedGoal: "",
   selectedPlanId: "",
@@ -294,6 +308,9 @@ export function openGuideFlow(): void {
   guideFlow.open = true;
   guideFlow.phase = "greeting";
   guideFlow.messages = [];
+  guideFlow.participantLabels = {};
+  guideFlow.leaderParticipantId = "";
+  guideFlow.secretaryCanFinalize = false;
   guideFlow.userInput = "";
   guideFlow.confirmedGoal = "";
   guideFlow.selectedPlanId = "";
@@ -317,6 +334,7 @@ export function pushGuideMessage(
   sender: GuideMessage["sender"],
   text: string,
   actions?: GuideAction[],
+  meta?: Pick<GuideMessage, "participantId" | "authorLabel" | "streamKey">,
 ): GuideMessage {
   const msg: GuideMessage = {
     id: nextGuideMessageId++,
@@ -324,6 +342,9 @@ export function pushGuideMessage(
     text,
     timestamp: new Date().toISOString(),
     actions,
+    participantId: meta?.participantId,
+    authorLabel: meta?.authorLabel,
+    streamKey: meta?.streamKey,
   };
   guideFlow.messages.push(msg);
   return msg;
@@ -364,6 +385,7 @@ const LEGACY_STORAGE_KEY = "donkey-studio-settings";
 
 type PersistedSettings = {
   globalApis: GlobalApiConfig[];
+  dutyRolePolicy: import("./types").DutyRolePolicy;
   activeGlobalApiIndex: number;
   apiKeys: ApiKeysForm;
   openaiCompatibleEndpoint: string;
@@ -375,6 +397,7 @@ export function saveSettings(): void {
   try {
     const data: PersistedSettings = {
       globalApis: state.globalApis,
+      dutyRolePolicy: state.dutyRolePolicy,
       activeGlobalApiIndex: state.activeGlobalApiIndex,
       apiKeys: state.apiKeys,
       openaiCompatibleEndpoint: state.openaiCompatibleEndpoint,
@@ -401,10 +424,75 @@ export function loadSettings(): void {
     const data = JSON.parse(raw) as Partial<PersistedSettings>;
 
     if (Array.isArray(data.globalApis) && data.globalApis.length > 0) {
-      state.globalApis = data.globalApis;
+      state.globalApis = data.globalApis.map((api) => ({
+        name:
+          api && typeof api === "object" && "name" in api && typeof (api as { name?: unknown }).name === "string"
+            ? (api as { name: string }).name
+            : "接口",
+        duty:
+          api && typeof api === "object" && "duty" in api
+            ? ((api as { duty?: unknown }).duty === "developer" ||
+                (api as { duty?: unknown }).duty === "frontend" ||
+                (api as { duty?: unknown }).duty === "tester" ||
+                (api as { duty?: unknown }).duty === "product_manager" ||
+                (api as { duty?: unknown }).duty === "mathematician" ||
+                (api as { duty?: unknown }).duty === "researcher" ||
+                (api as { duty?: unknown }).duty === "architect" ||
+                (api as { duty?: unknown }).duty === "reviewer"
+                ? ((api as { duty: import("./types").ApiDuty }).duty)
+                : "developer")
+            : "developer",
+        provider:
+          api && typeof api === "object" && "provider" in api
+            ? ((api as { provider: import("./types").Provider }).provider)
+            : "openai",
+        modelId:
+          api && typeof api === "object" && "modelId" in api && typeof (api as { modelId?: unknown }).modelId === "string"
+            ? (api as { modelId: string }).modelId
+            : "",
+        endpoint:
+          api && typeof api === "object" && "endpoint" in api && typeof (api as { endpoint?: unknown }).endpoint === "string"
+            ? (api as { endpoint: string }).endpoint
+            : "",
+        apiKey:
+          api && typeof api === "object" && "apiKey" in api && typeof (api as { apiKey?: unknown }).apiKey === "string"
+            ? (api as { apiKey: string }).apiKey
+            : "",
+      }));
     }
     if (typeof data.activeGlobalApiIndex === "number" && data.activeGlobalApiIndex >= 0) {
       state.activeGlobalApiIndex = Math.min(data.activeGlobalApiIndex, state.globalApis.length - 1);
+    }
+    if (data.dutyRolePolicy && typeof data.dutyRolePolicy === "object") {
+      const raw = data.dutyRolePolicy as Partial<import("./types").DutyRolePolicy>;
+      const normalizeRoleList = (roles: unknown, fallback: import("./types").Role[]): import("./types").Role[] => {
+        if (!Array.isArray(roles)) {
+          return fallback;
+        }
+
+        const valid = roles.filter(
+          (role): role is import("./types").Role =>
+            role === "proposer" ||
+            role === "critic" ||
+            role === "synthesizer" ||
+            role === "arbiter" ||
+            role === "researcher" ||
+            role === "verifier",
+        );
+
+        return valid.length > 0 ? valid : fallback;
+      };
+
+      state.dutyRolePolicy = {
+        developer: normalizeRoleList(raw.developer, state.dutyRolePolicy.developer),
+        frontend: normalizeRoleList(raw.frontend, state.dutyRolePolicy.frontend),
+        tester: normalizeRoleList(raw.tester, state.dutyRolePolicy.tester),
+        product_manager: normalizeRoleList(raw.product_manager, state.dutyRolePolicy.product_manager),
+        mathematician: normalizeRoleList(raw.mathematician, state.dutyRolePolicy.mathematician),
+        researcher: normalizeRoleList(raw.researcher, state.dutyRolePolicy.researcher),
+        architect: normalizeRoleList(raw.architect, state.dutyRolePolicy.architect),
+        reviewer: normalizeRoleList(raw.reviewer, state.dutyRolePolicy.reviewer),
+      };
     }
     if (data.apiKeys && typeof data.apiKeys === "object") {
       const keys = data.apiKeys;

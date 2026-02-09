@@ -56,11 +56,24 @@ export type ApiKeysForm = {
 
 export type GlobalApiConfig = {
   name: string;
+  duty: ApiDuty;
   provider: Provider;
   modelId: string;
   endpoint: string;
   apiKey: string;
 };
+
+export type ApiDuty =
+  | "developer"
+  | "frontend"
+  | "tester"
+  | "product_manager"
+  | "mathematician"
+  | "researcher"
+  | "architect"
+  | "reviewer";
+
+export type DutyRolePolicy = Record<ApiDuty, Role[]>;
 
 export type Provider =
   | "openai"
@@ -158,6 +171,9 @@ export type GuideMessage = {
   sender: GuideSender;
   text: string;
   timestamp: string;
+  participantId?: string;
+  authorLabel?: string;
+  streamKey?: string;
   /** 可选：附带快捷操作按钮 */
   actions?: GuideAction[];
 };
@@ -175,6 +191,10 @@ export type GuideFlowState = {
   open: boolean;
   phase: GuidePhase;
   messages: GuideMessage[];
+  participantLabels: Record<string, string>;
+  leaderParticipantId: string;
+  /** 是否明确授权秘书分身代拍 */
+  secretaryCanFinalize: boolean;
   userInput: string;
   /** 用户确认的目标 */
   confirmedGoal: string;
@@ -233,6 +253,7 @@ export type DashboardState = {
   toasts: UiToast[];
   apiKeys: ApiKeysForm;
   globalApis: GlobalApiConfig[];
+  dutyRolePolicy: DutyRolePolicy;
   activeGlobalApiIndex: number;
   globalApiImportText: string;
   openaiCompatibleEndpoint: string;

@@ -27,6 +27,49 @@ function toRunStatus(value: string | undefined): RunStatus | undefined {
   return undefined;
 }
 
+function roleLabel(role: string): string {
+  switch (role.toLowerCase()) {
+    case "proposer":
+      return "Proposer";
+    case "critic":
+      return "Critic";
+    case "synthesizer":
+      return "Synthesizer";
+    case "arbiter":
+      return "Arbiter";
+    case "researcher":
+      return "Researcher";
+    case "verifier":
+      return "Verifier";
+    default:
+      return role || "Member";
+  }
+}
+
+function providerLabel(provider: string): string {
+  switch (provider.toLowerCase()) {
+    case "openai":
+      return "OpenAI";
+    case "openai_compatible":
+      return "OpenAI Compatible";
+    case "anthropic":
+      return "Anthropic";
+    case "google":
+      return "Google";
+    case "deepseek":
+      return "DeepSeek";
+    default:
+      return provider || "Provider";
+  }
+}
+
+function resolveGuideParticipantLabel(participantId: string): string {
+  if (participantId === guideFlow.leaderParticipantId) {
+    return guideFlow.participantLabels[participantId] ?? "秘书（你的分身）";
+  }
+  return guideFlow.participantLabels[participantId] ?? `Member · ${participantId}`;
+}
+
 function updateParticipantsFromValue(value: unknown): void {
   if (!Array.isArray(value)) {
     return;
@@ -51,6 +94,14 @@ function updateParticipantsFromValue(value: unknown): void {
     });
 
   state.participants = parsed;
+
+  for (const participant of parsed) {
+    const label =
+      participant.participantId === guideFlow.leaderParticipantId
+        ? `秘书（你的分身） · ${providerLabel(participant.provider)}/${participant.modelId}`
+        : `${roleLabel(participant.role)} · ${providerLabel(participant.provider)}/${participant.modelId}`;
+    guideFlow.participantLabels[participant.participantId] = label;
+  }
 }
 
 function updateSnapshotBySession(
@@ -76,14 +127,10 @@ function isGuideFlowSession(sessionId: string | undefined): boolean {
     return false;
   }
 
-  // 如果已经绑定了 sessionId，直接匹配
   if (guideFlow.sessionId) {
     return guideFlow.sessionId === sessionId;
   }
 
-  // 尚未绑定 sessionId 时：
-  // 只要 guide 弹窗打开且 AI 正在思考（或刚刚完成思考），
-  // 并且该 session 没有被映射到任何办公室，就认为是 guide session
   if (!guideFlow.aiThinking && !guideFlow.creating) {
     return false;
   }
@@ -104,11 +151,11 @@ export function applyRpcResult(_method: string, result: unknown): void {
 
   const sessionId = parseString(record.session_id);
   if (sessionId) {
-    // 如果是引导对话的 session，不要映射到办公室，也不要覆盖 state.sessionId
-    const isGuideSession = guideFlow.open && (
-      guideFlow.sessionId === sessionId ||
-      (!guideFlow.sessionId && (guideFlow.aiThinking || guideFlow.creating))
-    );
+    const isGuideSession =
+      guideFlow.open &&
+      (guideFlow.sessionId === sessionId ||
+        (!guideFlow.sessionId && (guideFlow.aiThinking || guideFlow.creating)));
+
     if (!isGuideSession) {
       state.sessionId = sessionId;
       if (!state.sessionOfficeMap[sessionId]) {
@@ -177,19 +224,6 @@ export function handleNotification(envelope: NotificationEnvelope): void {
 
   const sessionId = parseString(params.session_id);
 
-  // 先检查是否属于 guide 对话的 session，避免错误映射到办公室
-  const isKnownGuideSession = sessionId && guideFlow.open && (
-    guideFlow.sessionId === sessionId ||
-    (!guideFlow.sessionId && (guideFlow.aiThinking || guideFlow.creating))
-  );
-
-  if (sessionId && !isKnownGuideSession && !state.sessionOfficeMap[sessionId]) {
-    const activeOffice = getActiveOffice();
-    if (activeOffice) {
-      setSessionOffice(sessionId, activeOffice.officeId);
-    }
-  }
-
   if (method === "session/state") {
     const sid = parseString(params.session_id);
     const status = parseString(params.status);
@@ -243,7 +277,7 @@ export function handleNotification(envelope: NotificationEnvelope): void {
         totalCost: cost,
         lastSummary:
           agreement !== undefined
-            ? `第${turn ?? 0}轮，共识 ${agreement.toFixed(3)}`
+            ? `第 ${turn ?? 0} 轮，共识 ${agreement.toFixed(3)}`
             : undefined,
       });
     }
@@ -271,7 +305,6 @@ export function handleNotification(envelope: NotificationEnvelope): void {
       });
     }
 
-    // 引导对话：当参与者完成回复时，标记 aiThinking = false
     if (matchedGuideSession) {
       guideFlow.aiThinking = false;
     }
@@ -295,27 +328,24 @@ export function handleNotification(envelope: NotificationEnvelope): void {
     updateSnapshotBySession(sid, {
       status: "running",
       turnIndex,
-      lastSummary: `${participantId} 正在输出第${turnIndex}轮内容`,
+      lastSummary: `${participantId} 正在输出第 ${turnIndex} 轮内容`,
     });
 
-    // 引导对话：将 AI 参与者的流式 chunk 追加到引导对话消息中
     if (matchedGuideSession && delta) {
-      const label = `🤖 ${participantId}`;
-      // 查找该参与者最后一条未完成的 AI 消息（通过 text 前缀匹配）
+      const authorLabel = resolveGuideParticipantLabel(participantId);
+      const streamKey = `${sid}:${turnIndex}:${participantId}`;
       const lastMsg = [...guideFlow.messages]
         .reverse()
-        .find(
-          (m) =>
-            m.sender === "ai" &&
-            m.text.startsWith(label),
-        );
+        .find((m) => m.sender === "ai" && m.streamKey === streamKey);
 
       if (lastMsg) {
-        // 追加 delta 到已有消息
         lastMsg.text += delta;
       } else {
-        // 创建新的 AI 消息（带参与者标识）
-        pushGuideMessage("ai", `${label}\n${delta}`);
+        pushGuideMessage("ai", delta, undefined, {
+          participantId,
+          authorLabel,
+          streamKey,
+        });
       }
     }
   }
@@ -345,8 +375,8 @@ export function handleNotification(envelope: NotificationEnvelope): void {
         status: wfStatus === "completed" ? "running" : "error",
         lastSummary:
           stepsTotal !== undefined
-            ? `workflow结束：${wfStatus}，步骤 ${stepsTotal}，失败 ${stepsError ?? 0}`
-            : `workflow结束：${wfStatus}`,
+            ? `workflow 结束：${wfStatus}，步骤 ${stepsTotal}，失败 ${stepsError ?? 0}`
+            : `workflow 结束：${wfStatus}`,
       });
     }
   }
