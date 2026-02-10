@@ -336,7 +336,7 @@ export function handleNotification(envelope: NotificationEnvelope): void {
       const streamKey = `${sid}:${turnIndex}:${participantId}`;
       const lastMsg = [...guideFlow.messages]
         .reverse()
-        .find((m) => m.sender === "ai" && m.streamKey === streamKey);
+        .find((m) => m?.sender === "ai" && m?.streamKey === streamKey);
 
       if (lastMsg) {
         lastMsg.text += delta;

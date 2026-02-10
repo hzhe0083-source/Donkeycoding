@@ -4,6 +4,7 @@ use serde_json::{json, Value};
 use std::error::Error;
 use std::time::Duration;
 use std::time::Instant;
+use tokio::time::sleep;
 
 fn format_error_chain(error: &dyn Error) -> String {
     let mut parts = Vec::new();
@@ -14,6 +15,25 @@ fn format_error_chain(error: &dyn Error) -> String {
         current = next.source();
     }
     parts.join(" | caused_by: ")
+}
+
+fn is_retryable_transport_message(message: &str) -> bool {
+    let lower = message.to_ascii_lowercase();
+    lower.contains("incompletemessage")
+        || lower.contains("connection closed before message completed")
+        || lower.contains("sendrequest")
+        || lower.contains("connection reset")
+        || lower.contains("broken pipe")
+}
+
+fn is_retryable_reqwest_error(error: &reqwest::Error) -> bool {
+    if error.is_timeout() || error.is_connect() || error.is_request() {
+        return true;
+    }
+
+    let chain = format_error_chain(error);
+    let debug = format!("{error:?}");
+    is_retryable_transport_message(&chain) || is_retryable_transport_message(&debug)
 }
 
 /// 统一的 LLM 调用接口
@@ -162,50 +182,80 @@ impl LlmAdapter {
             "temperature": 0.7,
         });
 
-        let response = self
-            .client
-            .post(&endpoint)
-            .header("Authorization", format!("Bearer {api_key}"))
-            .header("Content-Type", "application/json")
-            .json(&body)
-            .send()
-            .await
-            .map_err(|e| {
-                let chain = format_error_chain(&e);
-                format!(
-                    "HTTP request failed: {e}; endpoint={endpoint}; model={}; debug={e:?}; chain={chain}",
-                    participant.model_id,
-                )
-            })?;
+        const MAX_ATTEMPTS: usize = 2;
 
-        let status = response.status();
-        let text = response
-            .text()
-            .await
-            .map_err(|e| format!("Failed to read response body: {e}"))?;
+        for attempt in 1..=MAX_ATTEMPTS {
+            let response = match self
+                .client
+                .post(&endpoint)
+                .header("Authorization", format!("Bearer {api_key}"))
+                .header("Content-Type", "application/json")
+                .json(&body)
+                .send()
+                .await
+            {
+                Ok(response) => response,
+                Err(e) => {
+                    let chain = format_error_chain(&e);
+                    let message = format!(
+                        "HTTP request failed: {e}; endpoint={endpoint}; model={}; attempt={attempt}/{MAX_ATTEMPTS}; debug={e:?}; chain={chain}",
+                        participant.model_id,
+                    );
 
-        if !status.is_success() {
-            return Err(format!("API returned {status}: {text}"));
-        }
+                    if attempt < MAX_ATTEMPTS && is_retryable_reqwest_error(&e) {
+                        sleep(Duration::from_millis(300)).await;
+                        continue;
+                    }
 
-        let json: Value =
-            serde_json::from_str(&text).map_err(|e| {
+                    return Err(message);
+                }
+            };
+
+            let status = response.status();
+            let text = match response.text().await {
+                Ok(text) => text,
+                Err(e) => {
+                    let message = format!(
+                        "Failed to read response body: {e}; endpoint={endpoint}; model={}; attempt={attempt}/{MAX_ATTEMPTS}"
+                        , participant.model_id,
+                    );
+
+                    if attempt < MAX_ATTEMPTS && is_retryable_transport_message(&e.to_string()) {
+                        sleep(Duration::from_millis(300)).await;
+                        continue;
+                    }
+
+                    return Err(message);
+                }
+            };
+
+            if !status.is_success() {
+                return Err(format!("API returned {status}: {text}"));
+            }
+
+            let json: Value = serde_json::from_str(&text).map_err(|e| {
                 let preview = if text.len() > 200 { &text[..200] } else { &text };
                 format!("Failed to parse JSON: {e}; endpoint={endpoint}; body_preview={preview}")
             })?;
 
-        let content = json["choices"][0]["message"]["content"]
-            .as_str()
-            .unwrap_or("")
-            .to_string();
+            let content = json["choices"][0]["message"]["content"]
+                .as_str()
+                .unwrap_or("")
+                .to_string();
 
-        let usage = TokenUsage {
-            prompt_tokens: json["usage"]["prompt_tokens"].as_u64().unwrap_or(0),
-            completion_tokens: json["usage"]["completion_tokens"].as_u64().unwrap_or(0),
-            total_tokens: json["usage"]["total_tokens"].as_u64().unwrap_or(0),
-        };
+            let usage = TokenUsage {
+                prompt_tokens: json["usage"]["prompt_tokens"].as_u64().unwrap_or(0),
+                completion_tokens: json["usage"]["completion_tokens"].as_u64().unwrap_or(0),
+                total_tokens: json["usage"]["total_tokens"].as_u64().unwrap_or(0),
+            };
 
-        Ok((content, usage))
+            return Ok((content, usage));
+        }
+
+        Err(format!(
+            "HTTP request failed after retries; endpoint={endpoint}; model={}",
+            participant.model_id,
+        ))
     }
 
     /// Anthropic Messages API

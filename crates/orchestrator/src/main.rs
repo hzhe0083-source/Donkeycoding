@@ -1,5 +1,6 @@
 ﻿mod adapter;
 mod engine;
+mod memory;
 mod operators;
 mod types;
 
@@ -178,6 +179,16 @@ fn parse_chat_participants(params: Option<&Value>) -> Option<Vec<Participant>> {
     Some(parsed)
 }
 
+fn parse_chat_operators(params: Option<&Value>) -> Option<OperatorsConfig> {
+    let raw = params.and_then(|p| p.get("operators"))?.clone();
+    serde_json::from_value::<OperatorsConfig>(raw).ok()
+}
+
+fn parse_chat_review(params: Option<&Value>) -> Option<ReviewPolicy> {
+    let raw = params.and_then(|p| p.get("review"))?.clone();
+    serde_json::from_value::<ReviewPolicy>(raw).ok()
+}
+
 async fn handle_chat_send<W: Write>(
     engine: &mut Engine,
     params: Option<&Value>,
@@ -200,6 +211,8 @@ async fn handle_chat_send<W: Write>(
     }
 
     let custom_participants = parse_chat_participants(params);
+    let custom_operators = parse_chat_operators(params);
+    let custom_review = parse_chat_review(params);
 
     // 濡傛灉鏈?session_id锛屽皾璇曞湪鐜版湁浼氳瘽涓拷鍔犳秷鎭?
     // 鍚﹀垯鍒涘缓鏂颁細璇?
@@ -220,13 +233,15 @@ async fn handle_chat_send<W: Write>(
             let participants = custom_participants
                 .clone()
                 .unwrap_or_else(|| engine.default_participants());
+            let operators = custom_operators.clone().unwrap_or_default();
+            let review = custom_review.clone().unwrap_or_default();
             let session = engine.create_session(
                 user_message,
                 participants,
                 Policy::default(),
                 Budget::default(),
-                OperatorsConfig::default(),
-                ReviewPolicy::default(),
+                operators,
+                review,
             );
             let new_sid = session.session_id.clone();
             if let Some(session) = engine.get_session_mut(&new_sid) {
@@ -241,13 +256,15 @@ async fn handle_chat_send<W: Write>(
     } else {
         // 鏃?session_id锛屽垱寤烘柊浼氳瘽
         let participants = custom_participants.unwrap_or_else(|| engine.default_participants());
+        let operators = custom_operators.unwrap_or_default();
+        let review = custom_review.unwrap_or_default();
         let session = engine.create_session(
             user_message,
             participants,
             Policy::default(),
             Budget::default(),
-            OperatorsConfig::default(),
-            ReviewPolicy::default(),
+            operators,
+            review,
         );
         let new_sid = session.session_id.clone();
         if let Some(session) = engine.get_session_mut(&new_sid) {

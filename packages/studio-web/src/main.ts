@@ -5,7 +5,32 @@ import { guideFlow, loadSettings, pushLog, pushNotification, state } from "./sta
 import type { NotificationEnvelope, NotificationMethod } from "./types";
 import { mountStyles, patchDiscussionStream, render } from "./ui";
 
+function toErrorLogMessage(reason: unknown): string {
+  if (reason instanceof Error) {
+    return `${reason.name}: ${reason.message}`;
+  }
+  if (typeof reason === "string") {
+    return reason;
+  }
+  try {
+    return JSON.stringify(reason);
+  } catch {
+    return String(reason);
+  }
+}
+
 async function bootstrap(): Promise<void> {
+  window.addEventListener("error", (event) => {
+    const reason = event.error ?? event.message;
+    pushLog(`[window.error] ${toErrorLogMessage(reason)}`);
+    render();
+  });
+
+  window.addEventListener("unhandledrejection", (event) => {
+    pushLog(`[unhandledrejection] ${toErrorLogMessage(event.reason)}`);
+    render();
+  });
+
   loadSettings();
   mountStyles();
   render();

@@ -40,19 +40,443 @@ function isThinkingPlaceholder(text: string): boolean {
   return /^\[[^\]]+ thinking\.\.\.\]\s*$/.test(text.trim());
 }
 
+function normalizeGuideMessageText(text: unknown): string {
+  return typeof text === "string" ? text : "";
+}
+
+type GuideStructuredSections = {
+  team: string[];
+  workflow: string[];
+};
+
+const GUIDE_TEAM_ROLE_ORDER: Role[] = [
+  "proposer",
+  "critic",
+  "researcher",
+  "verifier",
+  "synthesizer",
+  "arbiter",
+];
+
+let guideRosterDraftMembers: OfficeMember[] = [];
+let guideRosterDraftSourceMessageId: number | null = null;
+let guideRosterDraftByMessageId: Record<number, OfficeMember[]> = {};
+
+function resetGuideRosterDraft(): void {
+  guideRosterDraftMembers = [];
+  guideRosterDraftSourceMessageId = null;
+  guideRosterDraftByMessageId = {};
+}
+
+function inferDutyFromText(text: string): ApiDuty | undefined {
+  const normalized = text.toLowerCase();
+
+  if (normalized.includes("产品经理") || normalized.includes("product manager") || normalized.includes("pm")) {
+    return "product_manager";
+  }
+  if (normalized.includes("前端") || normalized.includes("frontend")) {
+    return "frontend";
+  }
+  if (normalized.includes("测试") || normalized.includes("qa") || normalized.includes("tester")) {
+    return "tester";
+  }
+  if (normalized.includes("数学") || normalized.includes("mathematic")) {
+    return "mathematician";
+  }
+  if (normalized.includes("研究") || normalized.includes("research")) {
+    return "researcher";
+  }
+  if (normalized.includes("架构") || normalized.includes("architect")) {
+    return "architect";
+  }
+  if (normalized.includes("审查") || normalized.includes("reviewer")) {
+    return "reviewer";
+  }
+  if (normalized.includes("工程") || normalized.includes("developer") || normalized.includes("backend")) {
+    return "developer";
+  }
+
+  return undefined;
+}
+
+function inferRoleFromText(text: string): Role | undefined {
+  const normalized = text.toLowerCase();
+
+  if (normalized.includes("proposer") || normalized.includes("提案")) {
+    return "proposer";
+  }
+  if (normalized.includes("critic") || normalized.includes("质疑")) {
+    return "critic";
+  }
+  if (normalized.includes("synthesizer") || normalized.includes("整合")) {
+    return "synthesizer";
+  }
+  if (normalized.includes("arbiter") || normalized.includes("裁决")) {
+    return "arbiter";
+  }
+  if (normalized.includes("researcher") || normalized.includes("调研")) {
+    return "researcher";
+  }
+  if (normalized.includes("verifier") || normalized.includes("验证")) {
+    return "verifier";
+  }
+
+  return undefined;
+}
+
+function inferProviderFromText(text: string): Provider | undefined {
+  const normalized = text.toLowerCase();
+
+  if (
+    normalized.includes("openai compatible") ||
+    normalized.includes("openai_compatible") ||
+    normalized.includes("兼容")
+  ) {
+    return "openai_compatible";
+  }
+  if (normalized.includes("anthropic") || normalized.includes("claude")) {
+    return "anthropic";
+  }
+  if (normalized.includes("google") || normalized.includes("gemini")) {
+    return "google";
+  }
+  if (normalized.includes("deepseek")) {
+    return "deepseek";
+  }
+  if (normalized.includes("openai") || normalized.includes("gpt")) {
+    return "openai";
+  }
+
+  return undefined;
+}
+
+function inferModelFromText(text: string): string | undefined {
+  const explicit = text.match(/(?:model(?:_id)?|模型)\s*[:=：]\s*([A-Za-z0-9._:-]+)/i);
+  if (explicit && explicit[1]) {
+    return explicit[1].trim();
+  }
+
+  const bySlash = text.match(/\/(\s*[A-Za-z0-9._:-]{3,})\s*(?:$|\||,)/);
+  if (bySlash && bySlash[1]) {
+    return bySlash[1].trim();
+  }
+
+  return undefined;
+}
+
+function inferApiIndexFromText(text: string): number | undefined {
+  const apiMatch = text.match(/\bapi\s*[-_#]?\s*(\d{1,2})\b/i);
+  if (apiMatch && apiMatch[1]) {
+    const parsed = Number(apiMatch[1]);
+    if (Number.isInteger(parsed) && parsed >= 1) {
+      return parsed - 1;
+    }
+  }
+
+  const cnMatch = text.match(/接口\s*(\d{1,2})/);
+  if (cnMatch && cnMatch[1]) {
+    const parsed = Number(cnMatch[1]);
+    if (Number.isInteger(parsed) && parsed >= 1) {
+      return parsed - 1;
+    }
+  }
+
+  return undefined;
+}
+
+function buildGuideMembersFromTeamLines(lines: string[]): OfficeMember[] {
+  const availableProviders = getConfiguredProviders();
+  const fallbackProvider = availableProviders[0] ?? "openai";
+
+  const members = lines
+    .map((line, index) => {
+      const apiIndex = inferApiIndexFromText(line);
+      const referencedApi =
+        apiIndex !== undefined && apiIndex >= 0 && apiIndex < state.globalApis.length
+          ? state.globalApis[apiIndex]
+          : undefined;
+
+      const duty = inferDutyFromText(line) ?? asApiDuty(referencedApi?.duty as string | undefined);
+      const role =
+        inferRoleFromText(line) ??
+        (duty ? roleForDuty(duty) : undefined) ??
+        GUIDE_TEAM_ROLE_ORDER[index % GUIDE_TEAM_ROLE_ORDER.length];
+      const provider =
+        inferProviderFromText(line) ??
+        referencedApi?.provider ??
+        pickProviderForRole(role, availableProviders, fallbackProvider);
+      const modelId =
+        inferModelFromText(line) ??
+        referencedApi?.modelId.trim() ??
+        defaultModelByProvider(provider);
+      const endpoint =
+        referencedApi?.endpoint.trim() ||
+        (provider === "openai_compatible"
+          ? state.openaiCompatibleEndpoint.trim()
+          : provider === "anthropic"
+          ? state.anthropicCompatibleEndpoint.trim()
+          : "");
+
+      return {
+        participantId: `draft-${role}-${index + 1}`,
+        provider,
+        modelId,
+        endpoint,
+        apiKey: referencedApi?.apiKey.trim() ?? "",
+        role,
+        enabled: true,
+      } satisfies OfficeMember;
+    })
+    .filter((member) => member.modelId.trim().length > 0);
+
+  return members.slice(0, 8);
+}
+
+function remapRosterMembersForOffice(
+  officeId: string,
+  members: OfficeMember[],
+): OfficeMember[] {
+  const counters: Record<Role, number> = {
+    proposer: 0,
+    critic: 0,
+    synthesizer: 0,
+    arbiter: 0,
+    researcher: 0,
+    verifier: 0,
+  };
+
+  return members.map((member) => {
+    counters[member.role] += 1;
+    return {
+      ...member,
+      participantId: `${officeId}-${member.role}-${counters[member.role]}`,
+      enabled: true,
+    };
+  });
+}
+
+function isTeamHeading(text: string): boolean {
+  const normalized = text.toLowerCase();
+  return (
+    normalized.includes("team roster") ||
+    normalized.includes("团队分工") ||
+    normalized.includes("成员分工") ||
+    normalized.includes("分工表")
+  );
+}
+
+function isWorkflowHeading(text: string): boolean {
+  const normalized = text.toLowerCase();
+  return (
+    normalized.includes("execution workflow") ||
+    normalized.includes("workflow") ||
+    normalized.includes("执行流程") ||
+    normalized.includes("实施步骤") ||
+    normalized.includes("里程碑")
+  );
+}
+
+function isLikelyListLine(text: string): boolean {
+  return /^[-*•]\s+/.test(text) || /^\d+[.)、]\s+/.test(text);
+}
+
+function normalizeListLine(text: string): string {
+  return text.replace(/^[-*•]\s+/, "").replace(/^\d+[.)、]\s+/, "").trim();
+}
+
+function parseGuideStructuredSections(text: string): GuideStructuredSections {
+  const sections: GuideStructuredSections = {
+    team: [],
+    workflow: [],
+  };
+
+  const lines = text
+    .split(/\r?\n/)
+    .map((line) => line.trim())
+    .filter((line) => line.length > 0);
+
+  let current: keyof GuideStructuredSections | null = null;
+
+  for (const line of lines) {
+    if (isTeamHeading(line)) {
+      current = "team";
+      continue;
+    }
+
+    if (isWorkflowHeading(line)) {
+      current = "workflow";
+      continue;
+    }
+
+    if (!current) {
+      continue;
+    }
+
+    if (isLikelyListLine(line)) {
+      const normalized = normalizeListLine(line);
+      if (normalized) {
+        sections[current].push(normalized);
+      }
+      continue;
+    }
+
+    if (line.includes("|") && !/^[-|:\s]+$/.test(line)) {
+      const normalized = line.replace(/\|/g, " / ").replace(/\s+/g, " ").trim();
+      sections[current].push(normalized);
+      continue;
+    }
+
+    if (line.length <= 96 && /[:：]/.test(line)) {
+      sections[current].push(line);
+      continue;
+    }
+
+    current = null;
+  }
+
+  sections.team = Array.from(new Set(sections.team)).slice(0, 12);
+  sections.workflow = Array.from(new Set(sections.workflow)).slice(0, 12);
+
+  return sections;
+}
+
+function renderGuideStructuredPanel(
+  text: string,
+  messageId: number,
+): string {
+  const sections = parseGuideStructuredSections(text);
+  if (sections.team.length === 0 && sections.workflow.length === 0) {
+    delete guideRosterDraftByMessageId[messageId];
+    return "";
+  }
+
+  const draftMembers = buildGuideMembersFromTeamLines(sections.team);
+  if (draftMembers.length >= 2) {
+    guideRosterDraftByMessageId[messageId] = draftMembers;
+  } else {
+    delete guideRosterDraftByMessageId[messageId];
+  }
+
+  const renderCard = (title: string, rows: string[]): string => {
+    if (rows.length === 0) {
+      return "";
+    }
+
+    return `
+      <div class="guide-structured-card">
+        <div class="guide-structured-title">${escapeHtml(title)}</div>
+        <ul class="guide-structured-list">
+          ${rows.map((row) => `<li>${escapeHtml(row)}</li>`).join("")}
+        </ul>
+      </div>
+    `;
+  };
+
+  return `
+    <div class="guide-structured">
+      ${renderCard("Team Roster", sections.team)}
+      ${renderCard("Execution Workflow", sections.workflow)}
+      ${draftMembers.length >= 2
+        ? `<div class="guide-structured-actions">
+            <button
+              class="guide-msg-action guide-structured-apply"
+              data-guide-action="apply-roster"
+              data-guide-message-id="${messageId}"
+            >一键套用到办公室成员</button>
+          </div>`
+        : ""}
+    </div>
+  `;
+}
+
+function hasGuideWorkflowApproval(): boolean {
+  const latestUserMessage = [...guideFlow.messages]
+    .reverse()
+    .find((message) => message?.sender === "user")
+    ?.text;
+  const normalized = normalizeGuideMessageText(latestUserMessage).toLowerCase();
+
+  if (!normalized) {
+    return false;
+  }
+
+  const keywords = [
+    "同意",
+    "批准",
+    "拍板",
+    "执行吧",
+    "开始执行",
+    "可以执行",
+    "同意执行",
+    "approved",
+    "approve",
+    "go ahead",
+    "ship it",
+  ];
+
+  return keywords.some((keyword) => normalized.includes(keyword));
+}
+
+function parseIsoTimestampMs(input: string | undefined): number {
+  if (!input) {
+    return 0;
+  }
+
+  const value = Date.parse(input);
+  return Number.isFinite(value) ? value : 0;
+}
+
+function renderGuideChunkFallback(sinceTimestamp: string | undefined): string {
+  const sinceMs = parseIsoTimestampMs(sinceTimestamp);
+
+  const chunks = state.chunks
+    .filter((chunk) => {
+      if (guideFlow.sessionId && chunk.sessionId === guideFlow.sessionId) {
+        return true;
+      }
+
+      if (sinceMs <= 0) {
+        return false;
+      }
+
+      const chunkMs = parseIsoTimestampMs(chunk.time);
+      return chunkMs >= sinceMs - 1000;
+    })
+    .slice(0, 8)
+    .reverse();
+
+  if (chunks.length === 0) {
+    return "";
+  }
+
+  return chunks
+    .map(
+      (chunk) => `
+        <div class="guide-msg guide-msg-system guide-msg-chunk-fallback">
+          <div class="guide-msg-role">🛰️ 实时片段 · ${escapeHtml(chunk.participantId)} · 第${chunk.turnIndex}轮</div>
+          <div class="guide-msg-text">${escapeHtml(chunk.delta)}</div>
+        </div>
+      `,
+    )
+    .join("");
+}
+
 function hasGuideStreamedReplySince(anchorMessageId: number): boolean {
-  const anchorIndex = guideFlow.messages.findIndex((message) => message.id === anchorMessageId);
+  const anchorIndex = guideFlow.messages.findIndex((message) => message?.id === anchorMessageId);
   const candidates = anchorIndex >= 0 ? guideFlow.messages.slice(anchorIndex + 1) : guideFlow.messages;
 
   return candidates.some((message) => {
+    const bodyText = normalizeGuideMessageText(message?.text);
+
     if (
+      !message ||
       message.sender !== "ai" ||
-      message.text.includes("⚠️ 本轮回复失败")
+      bodyText.includes("⚠️ 本轮回复失败")
     ) {
       return false;
     }
 
-    const body = message.text.trim();
+    const body = bodyText.trim();
     return body.length > 0 && !isThinkingPlaceholder(body);
   });
 }
@@ -109,6 +533,61 @@ function appendGuideOutputsFallback(
       });
     }
   }
+}
+
+function isTauriDesktop(): boolean {
+  const maybeWindow = window as Window & {
+    __TAURI_INTERNALS__?: unknown;
+    __TAURI__?: unknown;
+  };
+  return Boolean(maybeWindow.__TAURI_INTERNALS__ ?? maybeWindow.__TAURI__);
+}
+
+async function handleWindowControl(
+  action: "minimize" | "toggle-maximize" | "close",
+): Promise<void> {
+  if (!isTauriDesktop()) {
+    return;
+  }
+
+  try {
+    const { getCurrentWindow } = await import("@tauri-apps/api/window");
+    const appWindow = getCurrentWindow();
+
+    if (action === "minimize") {
+      await appWindow.minimize();
+      return;
+    }
+
+    if (action === "close") {
+      await appWindow.close();
+      return;
+    }
+
+    const maximized = await appWindow.isMaximized();
+    if (maximized) {
+      await appWindow.unmaximize();
+    } else {
+      await appWindow.maximize();
+    }
+  } catch (error) {
+    console.error("window control failed", error);
+    toast("窗口操作失败，请重试", "error");
+  }
+}
+
+function renderWindowControls(): string {
+  if (!isTauriDesktop()) {
+    return "";
+  }
+
+  return `
+    <div class="window-controls" aria-label="window controls">
+      <button class="window-control-btn" id="btn-window-minimize" title="最小化" aria-label="最小化">—</button>
+      <button class="window-control-btn" id="btn-window-toggle-maximize" title="最大化/还原" aria-label="最大化或还原">□</button>
+      <button class="window-control-btn close" id="btn-window-close" title="关闭" aria-label="关闭">✕</button>
+    </div>
+  `;
 }
 
 const app = document.querySelector<HTMLDivElement>("#app")!;
@@ -183,6 +662,14 @@ const DEFAULT_DUTY_ROLE_POLICY: Record<ApiDuty, Role[]> = {
   reviewer: ["critic", "verifier", "arbiter"],
 };
 
+const GUIDE_REQUIRED_DUTIES: ApiDuty[] = [
+  "developer",
+  "frontend",
+  "tester",
+  "product_manager",
+  "mathematician",
+];
+
 function rolePriorityForDuty(duty: ApiDuty): Role[] {
   const configured = state.dutyRolePolicy[duty];
   if (Array.isArray(configured) && configured.length > 0) {
@@ -193,6 +680,25 @@ function rolePriorityForDuty(duty: ApiDuty): Role[] {
 
 function roleForDuty(duty: ApiDuty): Role {
   return rolePriorityForDuty(duty)[0] ?? "proposer";
+}
+
+function chooseOfficeRoundsFromWorkflowText(lines: string[]): number {
+  const joined = lines.join("\n");
+  const explicit = joined.match(/(?:max[_\s-]?rounds|轮次|rounds?)\s*[:=：]?\s*(\d{1,2})/i);
+  if (explicit?.[1]) {
+    return clampRounds(Number(explicit[1]));
+  }
+
+  if (lines.length >= 8) {
+    return 6;
+  }
+  if (lines.length >= 5) {
+    return 5;
+  }
+  if (lines.length >= 3) {
+    return 4;
+  }
+  return 3;
 }
 
 function asApiDuty(value: string | undefined): ApiDuty {
@@ -973,6 +1479,16 @@ function buildDesiredRolesFromApis(
   return roles;
 }
 
+function missingDutiesFromApis(apis: GlobalApiConfig[]): ApiDuty[] {
+  const existing = new Set(apis.map((api) => asApiDuty(api.duty as string)));
+  return GUIDE_REQUIRED_DUTIES.filter((duty) => !existing.has(duty));
+}
+
+function hasProviderDiversity(apis: GlobalApiConfig[]): boolean {
+  const providers = new Set(apis.map((api) => api.provider));
+  return providers.size >= 2;
+}
+
 function chooseBestApiForRole(
   role: Role,
   assignedIndexes: Set<number>,
@@ -1116,8 +1632,53 @@ function closeCreateOfficeFlow(): void {
   createOfficeFlow.syncMessage = "";
 }
 
+function applyGuideRosterDraftToActiveOffice(messageId: number): boolean {
+  const draft = guideRosterDraftByMessageId[messageId] ?? [];
+  if (draft.length < 2) {
+    toast("该方案没有可用的成员分工草案", "error");
+    return false;
+  }
+
+  let office = getActiveOffice();
+  if (!office) {
+    addOffice();
+    office = getActiveOffice();
+  }
+
+  if (!office) {
+    toast("创建办公室失败，请重试", "error");
+    return false;
+  }
+
+  const sourceMessage = guideFlow.messages.find((message) => message.id === messageId);
+  const sourceText = sourceMessage ? normalizeGuideMessageText(sourceMessage.text) : "";
+  const sections = parseGuideStructuredSections(sourceText);
+
+  office.members = remapRosterMembersForOffice(office.officeId, draft);
+  office.maxRounds = chooseOfficeRoundsFromWorkflowText(sections.workflow);
+  if (!office.officeName.trim()) {
+    office.officeName = `秘书方案办公室 ${state.offices.length}`;
+  }
+
+  const latestUserGoal = [...guideFlow.messages]
+    .reverse()
+    .find((message) => message?.sender === "user")
+    ?.text;
+  const fallbackGoal = normalizeGuideMessageText(latestUserGoal).trim();
+  if (!office.objective.trim()) {
+    office.objective = fallbackGoal || "根据秘书团队方案推进执行与交付。";
+  }
+
+  state.workspaceMode = "offices";
+  state.activeOfficeId = office.officeId;
+  guideRosterDraftMembers = draft;
+  guideRosterDraftSourceMessageId = messageId;
+  toast(`已套用 ${draft.length} 名成员到当前办公室`, "success");
+  return true;
+}
+
 function buildInstantOfficeMembers(officeId: string): OfficeMember[] {
-  const roles: Role[] = ["proposer", "critic", "synthesizer"];
+  const roles: Role[] = ["proposer", "critic", "researcher", "verifier", "synthesizer", "arbiter"];
 
   const configuredApis = state.globalApis.filter((api) => {
     const modelReady = api.modelId.trim().length > 0;
@@ -1196,7 +1757,7 @@ async function createOfficeAndKickoffDiscussion(
   office.officeName = officeName?.trim() || `Workerflow 讨论 ${state.offices.length}`;
   office.objective =
     goal?.trim() || "你是我的 Workerflow 结对搭档。先向我提 3 个澄清问题，再给出一版最小可执行流程。";
-  office.maxRounds = 1;
+  office.maxRounds = 4;
   office.members = buildInstantOfficeMembers(office.officeId);
   state.workspaceMode = "offices";
   state.humanDraftByOfficeId[office.officeId] = "";
@@ -1218,10 +1779,11 @@ async function createOfficeAndKickoffDiscussion(
 
     const kickoffResult = await sendOfficeChat(
       kickoffText?.trim() ||
-        "我们现在开始讨论 Workerflow。请先问我 3 个关键问题，然后给出第一步实施建议。",
+        "我们现在进入办公室执行阶段。请先输出：\n1) 成员分工表（工程/前端/数学/测试/产品）\n2) 前后端与信息流架构\n3) 里程碑计划与workflow步骤\n4) 测试与回归策略\n5) 需要我确认的最终决策点。",
     );
 
     if (kickoffResult.ok) {
+      queueHumanInputFocusForOffice(office.officeId);
       toast("办公室已创建，AI 已开始和你讨论 Workerflow", "success");
       return true;
     } else {
@@ -1793,6 +2355,11 @@ function renderGuideModal(): string {
 
   const messages = guideFlow.messages
     .map((message) => {
+      if (!message) {
+        return "";
+      }
+
+      const messageText = normalizeGuideMessageText(message.text);
       const cls = message.sender === "ai" ? "guide-msg-ai" : message.sender === "user" ? "guide-msg-user" : "guide-msg-system";
       const roleIcon = message.sender === "ai" ? "🤖" : message.sender === "user" ? "👤" : "⚙️";
       const roleLabel =
@@ -1803,16 +2370,45 @@ function renderGuideModal(): string {
           : "系统";
       // AI 消息使用 Markdown 渲染，用户消息保持纯文本
       const bodyHtml = message.sender === "ai"
-        ? `<div class="guide-msg-text md-body">${renderMarkdown(message.text)}</div>`
-        : `<div class="guide-msg-text">${escapeHtml(message.text)}</div>`;
+        ? `<div class="guide-msg-text md-body">${renderMarkdown(messageText)}</div>`
+        : `<div class="guide-msg-text">${escapeHtml(messageText)}</div>`;
+      const structuredHtml = message.sender === "ai" ? renderGuideStructuredPanel(messageText, message.id) : "";
+      const actionsHtml =
+        Array.isArray(message.actions) && message.actions.length > 0
+          ? `<div class="guide-msg-actions">${message.actions
+              .map((action) => {
+                const payloadAttr = action.payload
+                  ? ` data-guide-payload="${escapeHtml(action.payload)}"`
+                  : "";
+                return `<button class="guide-msg-action" data-guide-action="${escapeHtml(
+                  action.kind,
+                )}" data-guide-action-id="${escapeHtml(action.id)}"${payloadAttr}>${escapeHtml(
+                  action.label,
+                )}</button>`;
+              })
+              .join("")}</div>`
+          : "";
       return `
         <div class="guide-msg ${cls}">
           <div class="guide-msg-role">${roleIcon} ${escapeHtml(roleLabel)}</div>
           ${bodyHtml}
+          ${structuredHtml}
+          ${actionsHtml}
         </div>
       `;
     })
     .join("");
+
+  const latestUserMessage = [...guideFlow.messages]
+    .reverse()
+    .find((message) => message?.sender === "user");
+  const hasStreamedReply = latestUserMessage
+    ? hasGuideStreamedReplySince(latestUserMessage.id)
+    : false;
+
+  const chunkFallback = guideFlow.aiThinking && !hasStreamedReply
+    ? renderGuideChunkFallback(latestUserMessage?.timestamp)
+    : "";
 
   // AI 思考中的动画指示器
   const thinkingIndicator = guideFlow.aiThinking
@@ -1850,7 +2446,7 @@ function renderGuideModal(): string {
         </div>
 
         <div class="flow-modal-body">
-          <div class="guide-thread">${messages}${thinkingIndicator}</div>
+          <div class="guide-thread">${messages}${chunkFallback}${thinkingIndicator}</div>
 
           <label class="field guide-secretary-toggle">
             <input id="guide-secretary-delegate" type="checkbox" ${guideFlow.secretaryCanFinalize ? "checked" : ""} />
@@ -2106,6 +2702,35 @@ export function patchDiscussionStream(): void {
           .join("");
 }
 
+let pendingHumanInputFocusOfficeId = "";
+
+function queueHumanInputFocusForOffice(officeId: string): void {
+  pendingHumanInputFocusOfficeId = officeId;
+}
+
+function applyPendingHumanInputFocus(): void {
+  if (!pendingHumanInputFocusOfficeId) {
+    return;
+  }
+
+  const office = getActiveOffice();
+  if (!office || office.officeId !== pendingHumanInputFocusOfficeId) {
+    return;
+  }
+
+  const input = app.querySelector<HTMLTextAreaElement>("#human-input");
+  if (!input) {
+    return;
+  }
+
+  pendingHumanInputFocusOfficeId = "";
+  requestAnimationFrame(() => {
+    input.focus();
+    const len = input.value.length;
+    input.setSelectionRange(len, len);
+  });
+}
+
 let saveSettingsTimer: ReturnType<typeof setTimeout> | null = null;
 
 function debouncedSaveSettings(): void {
@@ -2119,69 +2744,88 @@ function debouncedSaveSettings(): void {
 }
 
 export function render(): void {
-  debouncedSaveSettings();
-  const office = getActiveOffice();
+  try {
+    debouncedSaveSettings();
+    const office = getActiveOffice();
 
-  const navItems = navModes
-    .map(
-      (mode) =>
-        `<button class="nav-item ${state.workspaceMode === mode ? "active" : ""}" data-nav-mode="${mode}">
-          <span class="nav-icon">${navIcon(mode)}</span>
-          <span class="nav-text">${navLabel(mode)}</span>
-        </button>`,
-    )
-    .join("");
+    const navItems = navModes
+      .map(
+        (mode) =>
+          `<button class="nav-item ${state.workspaceMode === mode ? "active" : ""}" data-nav-mode="${mode}">
+            <span class="nav-icon">${navIcon(mode)}</span>
+            <span class="nav-text">${navLabel(mode)}</span>
+          </button>`,
+      )
+      .join("");
 
-  const showRightPanel = state.workspaceMode === "offices";
+    const showRightPanel = state.workspaceMode === "offices";
 
-  app.innerHTML = `
-    <div class="frame">
-      <header class="topbar">
-        <div class="brand">
-          <span class="brand-icon">🫏</span>
-          <div class="brand-copy">
-            <span class="brand-text">BeBoss</span>
-            <span class="brand-sub">AI Workerflow 协作平台</span>
-          </div>
-        </div>
-        <div class="topbar-right">
-          <div class="engine-status ${state.orchestratorRunning ? "online" : "offline"}">
-            <span class="engine-dot"></span>
-            引擎：${state.orchestratorRunning ? "在线" : "离线"}
-          </div>
-        </div>
-      </header>
-
-      <div class="body ${showRightPanel ? "" : "no-right-panel"}">
-        <aside class="left-nav">
-          <div class="nav-group">
-            ${navItems}
-          </div>
-          <div class="nav-bottom">
-            <div class="profile profile-trigger" id="btn-profile-settings" role="button" tabindex="0">
-              <span class="profile-avatar">U</span>
-              <div class="profile-copy">
-                <span class="profile-name">当前用户</span>
-                <span class="profile-role">Workspace Admin</span>
-              </div>
+    app.innerHTML = `
+      <div class="frame">
+        <header class="topbar" data-tauri-drag-region>
+          <div class="brand">
+            <span class="brand-mark" aria-hidden="true"></span>
+            <div class="brand-copy">
+              <span class="brand-text">BeBoss</span>
+              <span class="brand-sub">AI Workerflow 协作平台</span>
             </div>
           </div>
-        </aside>
+          <div class="topbar-right">
+            <div class="engine-status ${state.orchestratorRunning ? "online" : "offline"}">
+              <span class="engine-dot"></span>
+              引擎：${state.orchestratorRunning ? "在线" : "离线"}
+            </div>
+            ${renderWindowControls()}
+          </div>
+        </header>
 
-        <main class="center">
-          ${renderCenterContent()}
-        </main>
+        <div class="body ${showRightPanel ? "" : "no-right-panel"}">
+          <aside class="left-nav">
+            <div class="nav-group">
+              ${navItems}
+            </div>
+            <div class="nav-bottom">
+              <div class="profile profile-trigger" id="btn-profile-settings" role="button" tabindex="0">
+                <span class="profile-avatar">U</span>
+                <div class="profile-copy">
+                  <span class="profile-name">当前用户</span>
+                  <span class="profile-role">Workspace Admin</span>
+                </div>
+              </div>
+            </div>
+          </aside>
 
-        ${showRightPanel ? `<aside class="right-panel">${renderDiscussionPanel()}</aside>` : ""}
+          <main class="center">
+            ${renderCenterContent()}
+          </main>
+
+          ${showRightPanel ? `<aside class="right-panel">${renderDiscussionPanel()}</aside>` : ""}
+        </div>
       </div>
-    </div>
-    ${renderCreateOfficeModal()}
-    ${renderProfileSettingsModal()}
-    ${renderGuideModal()}
-    ${renderToasts()}
-  `;
+      ${renderCreateOfficeModal()}
+      ${renderProfileSettingsModal()}
+      ${renderGuideModal()}
+      ${renderToasts()}
+    `;
 
-  bindEvents(office);
+    bindEvents(office);
+    applyPendingHumanInputFocus();
+  } catch (error) {
+    const message = error instanceof Error ? error.message : String(error);
+    console.error("[ui] render crashed", error);
+
+    app.innerHTML = `
+      <div class="frame">
+        <main class="center">
+          <section class="card">
+            <h3>界面渲染异常</h3>
+            <p class="muted">${escapeHtml(message)}</p>
+            <p class="muted">请重试操作；若复现，请把日志面板最后几行发我。</p>
+          </section>
+        </main>
+      </div>
+    `;
+  }
 }
 
 function bindEvents(office: OfficeDraft | undefined): void {
@@ -2219,6 +2863,22 @@ function bindEvents(office: OfficeDraft | undefined): void {
     closeProfileApiEditor();
     profileSettingsModalOpen = false;
     render();
+  });
+
+  app
+    .querySelector<HTMLButtonElement>("#btn-window-minimize")
+    ?.addEventListener("click", () => {
+      void handleWindowControl("minimize");
+    });
+
+  app
+    .querySelector<HTMLButtonElement>("#btn-window-toggle-maximize")
+    ?.addEventListener("click", () => {
+      void handleWindowControl("toggle-maximize");
+    });
+
+  app.querySelector<HTMLButtonElement>("#btn-window-close")?.addEventListener("click", () => {
+    void handleWindowControl("close");
   });
 
   app.querySelector<HTMLDivElement>("#profile-settings-mask")?.addEventListener("click", (event) => {
@@ -2434,6 +3094,7 @@ function bindEvents(office: OfficeDraft | undefined): void {
         return;
       }
       setActiveOffice(officeId);
+      state.workspaceMode = "offices";
       const snapshot = getSnapshot(officeId);
       state.sessionId = snapshot.sessionId;
       render();
@@ -2483,7 +3144,62 @@ function bindEvents(office: OfficeDraft | undefined): void {
       return;
     }
 
+    const readyApis = state.globalApis.filter((api) => {
+      const modelReady = api.modelId.trim().length > 0;
+      const keyReady = api.apiKey.trim().length > 0 || hasProviderKey(api.provider);
+      return modelReady && keyReady;
+    });
+
+    const missingDuties = missingDutiesFromApis(readyApis);
+    const diversifiedProviders = hasProviderDiversity(readyApis);
+
     const userMessage = pushGuideMessage("user", text);
+
+    if (readyApis.length < 3) {
+      pushGuideMessage(
+        "ai",
+        `我先盘了下当前可用成员：仅 ${readyApis.length} 个可用 API。\n\n建议先补充到至少 3 个（最好 5 个），再做“工程师/前端/数学家/测试/产品经理”分工。\n请先去左下角「当前用户」补充 API 后再继续。`,
+        [
+          {
+            id: "guide-open-profile-api-shortage",
+            label: "去补 API",
+            kind: "edit",
+            payload: "open-profile-settings",
+          },
+        ],
+      );
+    } else if (missingDuties.length > 0) {
+      const dutyText = missingDuties
+        .map((duty) => API_DUTY_LABELS[duty])
+        .filter(Boolean)
+        .join("、");
+      pushGuideMessage(
+        "ai",
+        `当前 API 职务还不完整，缺少：${dutyText}。\n\n为了让秘书能完整编制“技术-前端-数学-测试-产品”协同链路，建议先补齐这些职务配置。`,
+        [
+          {
+            id: "guide-open-profile-api-duty-gap",
+            label: "去补职务",
+            kind: "edit",
+            payload: "open-profile-settings",
+          },
+        ],
+      );
+    } else if (!diversifiedProviders) {
+      pushGuideMessage(
+        "ai",
+        "注意：目前 API 都来自同一厂商，容易出现思路同质化。\n建议至少接入 2 家厂商后再进入最终 workflow 拍板。",
+        [
+          {
+            id: "guide-open-profile-api-diversity",
+            label: "去补厂商",
+            kind: "edit",
+            payload: "open-profile-settings",
+          },
+        ],
+      );
+    }
+
     guideFlow.userInput = "";
     guideFlow.aiThinking = true;
     render();
@@ -2532,6 +3248,32 @@ function bindEvents(office: OfficeDraft | undefined): void {
     sendGuideMessage();
   });
 
+  app.querySelectorAll<HTMLButtonElement>("[data-guide-action]").forEach((button) => {
+    button.addEventListener("click", () => {
+      const actionKind = button.dataset.guideAction;
+      const messageId = Number(button.dataset.guideMessageId ?? "");
+
+      if (actionKind === "apply-roster") {
+        if (!Number.isInteger(messageId)) {
+          toast("方案来源无效，无法套用", "error");
+          return;
+        }
+
+        const applied = applyGuideRosterDraftToActiveOffice(messageId);
+        if (applied) {
+          render();
+        }
+        return;
+      }
+
+      const payload = button.dataset.guidePayload;
+      if (payload === "open-profile-settings") {
+        profileSettingsModalOpen = true;
+        render();
+      }
+    });
+  });
+
   app.querySelector<HTMLTextAreaElement>("#guide-input")?.addEventListener("keydown", (event) => {
     if (event.key !== "Enter" || event.shiftKey || event.isComposing) {
       return;
@@ -2542,11 +3284,45 @@ function bindEvents(office: OfficeDraft | undefined): void {
   });
 
   app.querySelector<HTMLButtonElement>("#btn-guide-create")?.addEventListener("click", async () => {
+    const readyApis = state.globalApis.filter((api) => {
+      const modelReady = api.modelId.trim().length > 0;
+      const keyReady = api.apiKey.trim().length > 0 || hasProviderKey(api.provider);
+      return modelReady && keyReady;
+    });
+    const missingDuties = missingDutiesFromApis(readyApis);
+
+    if (readyApis.length < 3) {
+      pushGuideMessage(
+        "ai",
+        `我这边评估人手不足（仅 ${readyApis.length} 个可用 API），暂不建议创建办公室。\n请先补充 API（建议至少 5 个），我再继续组织协作。`,
+      );
+      render();
+      return;
+    }
+
+    if (missingDuties.length > 0) {
+      pushGuideMessage(
+        "ai",
+        `创建前提醒：你还没补齐这些关键职务：${missingDuties.map((duty) => API_DUTY_LABELS[duty]).join("、")}。\n请先补齐，避免 workflow 落地时出现断层。`,
+      );
+      render();
+      return;
+    }
+
+    if (!guideFlow.secretaryCanFinalize && !hasGuideWorkflowApproval()) {
+      pushGuideMessage(
+        "ai",
+        "当前还没有看到你对 workflow 的明确拍板。\n请先回复“同意执行”或勾选“授权秘书代拍”，我再创建办公室并开工。",
+      );
+      render();
+      return;
+    }
+
     const latestUserGoal = [...guideFlow.messages]
       .reverse()
-      .find((message) => message.sender === "user")
+      .find((message) => message?.sender === "user")
       ?.text;
-    const finalGoal = latestUserGoal?.trim() || "一起讨论 Workerflow 的初步构想并形成执行计划";
+    const finalGoal = normalizeGuideMessageText(latestUserGoal).trim() || "一起讨论 Workerflow 的初步构想并形成执行计划";
 
     guideFlow.creating = true;
     render();
@@ -2768,6 +3544,7 @@ function bindEvents(office: OfficeDraft | undefined): void {
 
       const startResult = await startOfficeDebate();
       if (startResult.ok) {
+        queueHumanInputFocusForOffice(office.officeId);
         toast("办公室已创建并自动开始讨论", "success");
       } else {
         toast(`办公室已创建，但自动启动失败：${startResult.message}`, "error");
@@ -3544,6 +4321,11 @@ export function mountStyles(): void {
     .guide-msg-system {
       border-color: #e4d5ff;
       background: #f6f1ff;
+    }
+    .guide-msg-chunk-fallback {
+      border-style: dashed;
+      border-color: #c7d2fe;
+      background: #f5f7ff;
     }
     .guide-msg-role {
       font-size: 11px;
@@ -5266,6 +6048,26 @@ export function mountStyles(): void {
       --danger: #dc2626;
       --radius-lg: 12px;
       --radius-md: 10px;
+      --space-1: 4px;
+      --space-2: 8px;
+      --space-3: 10px;
+      --space-4: 12px;
+      --space-5: 14px;
+      --space-6: 16px;
+      --space-7: 18px;
+      --space-8: 20px;
+      --space-9: 24px;
+      --font-xs: 11px;
+      --font-sm: 12px;
+      --font-md: 13px;
+      --font-lg: 14px;
+      --font-xl: 18px;
+      --font-2xl: 22px;
+      --font-3xl: 24px;
+      --font-display: 30px;
+      --lh-tight: 1.2;
+      --lh-normal: 1.5;
+      --lh-relaxed: 1.6;
       --shadow-sm: 0 4px 14px rgba(15, 23, 42, 0.06);
       --shadow-md: 0 18px 38px rgba(15, 23, 42, 0.18);
     }
@@ -5274,25 +6076,25 @@ export function mountStyles(): void {
       color: var(--text);
     }
     #app {
-      padding: 14px;
+      padding: var(--space-5);
     }
     .frame {
       border: 1px solid var(--line);
       border-radius: var(--radius-lg);
       background: var(--panel);
       box-shadow: var(--shadow-sm);
-      min-height: calc(100vh - 28px);
+      min-height: calc(100vh - (var(--space-5) * 2));
     }
     .topbar {
       height: 68px;
-      padding: 0 16px;
+      padding: 0 var(--space-6);
       border-bottom: 1px solid var(--line);
       background: #ffffff;
     }
     .brand {
       display: inline-flex;
       align-items: center;
-      gap: 10px;
+      gap: var(--space-3);
     }
     .brand-icon {
       width: 30px;
@@ -5306,7 +6108,7 @@ export function mountStyles(): void {
     }
     .brand-copy {
       display: grid;
-      gap: 2px;
+      gap: var(--space-1);
       line-height: 1;
     }
     .brand-text {
@@ -5316,7 +6118,7 @@ export function mountStyles(): void {
       letter-spacing: 0;
     }
     .brand-sub {
-      font-size: 11px;
+      font-size: var(--font-xs);
       color: var(--muted);
     }
     .engine-status {
@@ -5324,11 +6126,11 @@ export function mountStyles(): void {
       border-radius: 999px;
       background: #f8fafc;
       color: #475569;
-      padding: 6px 11px;
+      padding: calc(var(--space-1) + 2px) calc(var(--space-2) + 3px);
       font-weight: 600;
       display: inline-flex;
       align-items: center;
-      gap: 8px;
+      gap: var(--space-2);
     }
     .engine-dot {
       width: 8px;
@@ -5359,8 +6161,8 @@ export function mountStyles(): void {
     .left-nav {
       background: var(--panel-soft);
       border-right: 1px solid var(--line);
-      padding: 12px 10px;
-      gap: 10px;
+      padding: var(--space-4) var(--space-3);
+      gap: var(--space-3);
     }
     .nav-group {
       display: grid;
@@ -5371,12 +6173,12 @@ export function mountStyles(): void {
       border-radius: var(--radius-md);
       background: transparent;
       color: #334155;
-      padding: 10px 12px;
-      font-size: 14px;
+      padding: var(--space-3) var(--space-4);
+      font-size: var(--font-lg);
       font-weight: 600;
       display: inline-flex;
       align-items: center;
-      gap: 10px;
+      gap: var(--space-3);
       text-align: left;
       transition: background-color 120ms ease, border-color 120ms ease, color 120ms ease;
     }
@@ -5403,10 +6205,10 @@ export function mountStyles(): void {
       border: 1px solid var(--line);
       border-radius: var(--radius-md);
       background: #ffffff;
-      padding: 10px;
+      padding: var(--space-3);
       display: flex;
       align-items: center;
-      gap: 10px;
+      gap: var(--space-3);
     }
     .profile-avatar {
       width: 28px;
@@ -5422,22 +6224,22 @@ export function mountStyles(): void {
     }
     .profile-name {
       color: #0f172a;
-      font-size: 13px;
+      font-size: var(--font-md);
       font-weight: 700;
     }
     .profile-role {
       color: var(--muted);
-      font-size: 11px;
+      font-size: var(--font-xs);
     }
 
     .center {
       border-right: 1px solid var(--line);
       background: #f5f7fb;
-      padding: 16px;
+      padding: var(--space-6);
     }
     .right-panel {
       background: var(--panel-soft);
-      padding: 14px;
+      padding: var(--space-5);
     }
     .right-title {
       font-size: 24px;
@@ -5447,14 +6249,14 @@ export function mountStyles(): void {
       margin-top: 0;
     }
     .right-sub {
-      font-size: 12px;
+      font-size: var(--font-sm);
       color: var(--muted);
-      margin-top: 4px;
+      margin-top: var(--space-1);
     }
 
     .grid {
       grid-template-columns: repeat(3, minmax(210px, 1fr));
-      gap: 12px;
+      gap: var(--space-4);
     }
     .office-card {
       min-height: 156px;
@@ -5462,8 +6264,8 @@ export function mountStyles(): void {
       border-radius: var(--radius-md);
       background: #ffffff;
       box-shadow: 0 2px 8px rgba(15, 23, 42, 0.04);
-      padding: 12px;
-      gap: 6px;
+      padding: var(--space-4);
+      gap: var(--space-2);
       transition: border-color 120ms ease, box-shadow 120ms ease;
     }
     .office-card:hover {
@@ -5483,11 +6285,11 @@ export function mountStyles(): void {
     }
     .office-line {
       color: #475569;
-      font-size: 12px;
+      font-size: var(--font-sm);
     }
     .office-meta {
       color: #64748b;
-      font-size: 12px;
+      font-size: var(--font-sm);
     }
     .office-card.add {
       border-style: dashed;
@@ -5518,12 +6320,12 @@ export function mountStyles(): void {
     }
 
     .field {
-      gap: 6px;
-      margin-top: 10px;
+      gap: var(--space-2);
+      margin-top: var(--space-3);
     }
     .field span {
       color: #475569;
-      font-size: 12px;
+      font-size: var(--font-sm);
       font-weight: 600;
     }
     input, textarea, select {
@@ -5531,8 +6333,8 @@ export function mountStyles(): void {
       border-radius: 8px;
       background: #ffffff;
       color: var(--text);
-      padding: 8px 10px;
-      font-size: 13px;
+      padding: var(--space-2) var(--space-3);
+      font-size: var(--font-md);
     }
     input:focus-visible, textarea:focus-visible, select:focus-visible, button:focus-visible {
       border-color: var(--accent);
@@ -5544,9 +6346,9 @@ export function mountStyles(): void {
       border-radius: 8px;
       background: #ffffff;
       color: #334155;
-      font-size: 13px;
+      font-size: var(--font-md);
       font-weight: 600;
-      padding: 8px 11px;
+      padding: var(--space-2) calc(var(--space-2) + 3px);
       transition: border-color 120ms ease, background-color 120ms ease;
     }
     button:hover {
@@ -5597,8 +6399,6 @@ export function mountStyles(): void {
     .global-api-card,
     .sub-event-item,
     .sub-chunk-item,
-    .guide-thread,
-    .guide-msg,
     .flow-section,
     .flow-plan-card,
     .flow-preview-box,
@@ -5606,10 +6406,259 @@ export function mountStyles(): void {
       border-color: var(--line);
       background: #ffffff;
     }
+    .flow-modal-mask {
+      background: rgba(15, 23, 42, 0.42);
+      backdrop-filter: blur(8px);
+    }
+    .flow-modal {
+      border-color: #e7d7bf;
+      border-radius: 16px;
+      box-shadow: 0 18px 42px rgba(15, 23, 42, 0.24);
+      background: linear-gradient(180deg, #fffdf9 0%, #fff8ed 100%);
+    }
+    .flow-modal-head {
+      border-bottom: 1px solid #eadcc7;
+      background: linear-gradient(180deg, #fffaf2 0%, #fff3e3 100%);
+    }
+    .flow-modal-foot {
+      border-top: 1px solid #eadcc7;
+      background: #fff7ea;
+      position: sticky;
+      bottom: 0;
+      z-index: 2;
+    }
+    .guide-thread {
+      border: 1px solid #eadac2;
+      border-radius: 14px;
+      background: linear-gradient(180deg, #fffaf2 0%, #fffdf9 100%);
+      box-shadow: inset 0 1px 0 rgba(255, 255, 255, 0.9);
+      max-height: 360px;
+      padding: 12px;
+      gap: 10px;
+    }
+    .guide-msg {
+      border: 1px solid #e8d8c2;
+      border-radius: 12px;
+      padding: 10px 12px;
+      background: #ffffff;
+      box-shadow: 0 2px 8px rgba(15, 23, 42, 0.05);
+    }
+    .guide-msg-ai {
+      border-left: 4px solid #d39a58;
+      background: #fff5e7;
+    }
+    .guide-msg-user {
+      border-left: 4px solid #78a35f;
+      background: #f4f9ee;
+    }
+    .guide-msg-system {
+      border-left: 4px solid #8f78c8;
+      background: #f7f3ff;
+    }
+    .guide-msg-chunk-fallback {
+      border-style: dashed;
+      border-left-width: 4px;
+      border-color: #d8c8f6;
+      background: #f7f4ff;
+    }
+    .guide-msg-role {
+      font-size: 12px;
+      font-weight: 800;
+      margin-bottom: 6px;
+      color: #5f4325;
+    }
+    .guide-msg-text {
+      font-size: 13px;
+      line-height: 1.6;
+      color: #43392d;
+    }
+    .guide-thinking {
+      border-style: dashed;
+      border-color: #ebd6bb;
+      background: #fff7ea;
+    }
+    .thinking-indicator {
+      gap: 10px;
+    }
+    .thinking-label {
+      font-size: 12px;
+      font-weight: 600;
+      color: #9a6228;
+    }
+    #guide-input {
+      min-height: 96px;
+      border-radius: 10px;
+      background: #fffdf9;
+    }
+    .body {
+      background: linear-gradient(180deg, #f8fafd 0%, #f4f7fb 100%);
+    }
+    .left-nav {
+      background: linear-gradient(180deg, #ffffff 0%, #f8fafd 100%);
+      border-right: 1px solid #e2e8f0;
+      padding: 14px 12px;
+      gap: 12px;
+      box-shadow: inset -1px 0 0 rgba(148, 163, 184, 0.08);
+    }
+    .nav-item {
+      border-color: #e8eef6;
+      border-radius: 12px;
+      background: #ffffff;
+      box-shadow: 0 1px 2px rgba(15, 23, 42, 0.04);
+    }
+    .nav-item:hover {
+      border-color: #f2c572;
+      background: #fffdf7;
+      box-shadow: 0 4px 12px rgba(15, 23, 42, 0.08);
+    }
+    .nav-item.active {
+      border-color: #f2c572;
+      background: #fffaf0;
+      box-shadow: inset 4px 0 0 var(--accent), 0 6px 14px rgba(245, 158, 11, 0.12);
+    }
+    .profile {
+      border-color: #e2e8f0;
+      border-radius: 12px;
+      box-shadow: 0 1px 2px rgba(15, 23, 42, 0.04);
+    }
+    .center {
+      background: linear-gradient(180deg, #f9fbff 0%, #f5f8fc 100%);
+      padding: 18px;
+    }
+    .right-panel {
+      border-left: 1px solid #e2e8f0;
+      background: linear-gradient(180deg, #ffffff 0%, #f8fafd 100%);
+      padding: var(--space-6);
+      display: grid;
+      align-content: start;
+      gap: var(--space-3);
+    }
+    .right-title {
+      margin: 0;
+      font-size: 22px;
+      line-height: 1.2;
+      font-weight: 800;
+      color: #0f172a;
+    }
+    .right-sub {
+      margin: 0 0 8px 0;
+      font-size: var(--font-sm);
+      color: #64748b;
+    }
+    .grid {
+      gap: var(--space-5);
+    }
+    .office-card {
+      min-height: 164px;
+      border-radius: 12px;
+      box-shadow: 0 3px 10px rgba(15, 23, 42, 0.06);
+      gap: 8px;
+    }
+    .office-card.active {
+      border-color: #f2c572;
+      box-shadow: 0 0 0 1px rgba(245, 158, 11, 0.22), 0 8px 18px rgba(245, 158, 11, 0.14);
+      background: #fffdf7;
+    }
+    .discussion-box {
+      margin-top: 4px;
+      min-height: 260px;
+      max-height: 380px;
+      border: 1px solid #dfe7f2;
+      border-radius: 12px;
+      padding: var(--space-4);
+      background: #ffffff;
+      box-shadow: inset 0 1px 0 rgba(255, 255, 255, 0.8);
+      display: grid;
+      gap: var(--space-3);
+    }
     .message-item {
-      border-color: var(--line);
-      background: #f8fafc;
-      border-radius: 8px;
+      margin-bottom: 0;
+      border: 1px solid #e3eaf4;
+      border-left: 4px solid #f2c572;
+      background: #f8fbff;
+      border-radius: 10px;
+      padding: 10px;
+      box-shadow: 0 1px 4px rgba(15, 23, 42, 0.04);
+    }
+    .message-head {
+      color: #7c4a15;
+      font-size: var(--font-sm);
+      font-weight: 700;
+      margin-bottom: var(--space-2);
+    }
+    .message-body {
+      color: #334155;
+      font-size: var(--font-md);
+      line-height: var(--lh-relaxed);
+      word-break: break-word;
+      white-space: pre-wrap;
+    }
+    .actions {
+      margin-top: 6px;
+      gap: var(--space-3);
+    }
+    .right-divider {
+      border-top: 1px dashed #d9e2ee;
+      margin: 16px 0;
+    }
+    .member-editor {
+      margin-top: 4px;
+      border: 1px solid #dfe7f2;
+      border-radius: 12px;
+      background: #ffffff;
+      box-shadow: 0 1px 2px rgba(15, 23, 42, 0.04);
+      padding: var(--space-4);
+      gap: var(--space-3);
+    }
+    .member-editor-title {
+      color: #1f2937;
+      font-size: 13px;
+      font-weight: 700;
+    }
+    .member-editor-row {
+      border: 1px dashed #d8e2ef;
+      border-radius: 10px;
+      padding: var(--space-2);
+      background: #fcfdff;
+    }
+    .member-list {
+      display: grid;
+      gap: 10px;
+    }
+    .member-row {
+      border: 1px solid #dfe7f2;
+      border-radius: 10px;
+      padding: var(--space-3);
+      background: #ffffff;
+      box-shadow: 0 1px 3px rgba(15, 23, 42, 0.04);
+    }
+    .member-row b {
+      display: block;
+      font-size: 13px;
+      color: #111827;
+      margin-bottom: 4px;
+    }
+    .member-row span {
+      color: #b45309;
+      font-size: var(--font-sm);
+      font-weight: 600;
+    }
+    .member-row p {
+      margin: 6px 0 0;
+      color: #64748b;
+      font-size: var(--font-sm);
+      line-height: 1.45;
+    }
+    #human-input {
+      min-height: 92px;
+      border-radius: 10px;
+      background: #ffffff;
+    }
+    #workflow-script {
+      border-radius: 10px;
+      background: #ffffff;
+      font-family: "Cascadia Code", "Fira Code", "Consolas", monospace;
+      font-size: var(--font-sm);
     }
     .message-head,
     .sub-event-method,
@@ -5624,9 +6673,19 @@ export function mountStyles(): void {
       border-bottom: 1px solid var(--line);
     }
 
+    .dashboard-view,
+    .subscription-view {
+      padding: 4px 0;
+      display: grid;
+      gap: var(--space-5);
+    }
     .view-title {
-      font-size: 28px;
-      color: #111827;
+      margin: 0;
+      font-size: 30px;
+      line-height: 1.12;
+      font-weight: 800;
+      color: #0f172a;
+      letter-spacing: -0.01em;
     }
     .view-desc,
     .muted,
@@ -5637,22 +6696,21 @@ export function mountStyles(): void {
     .office-add-sub {
       color: #64748b;
     }
-    .dash-section {
-      border-radius: 10px;
-      padding: 12px;
-      margin-bottom: 14px;
+    .view-desc {
+      margin: 0;
+      font-size: var(--font-md);
     }
-    .dash-section h3 {
-      color: #111827;
-      font-size: 14px;
-      font-weight: 700;
+    .dash-summary-grid {
+      display: grid;
+      grid-template-columns: repeat(4, minmax(140px, 1fr));
+      gap: var(--space-4);
     }
     .dash-card {
-      border: 1px solid var(--line);
-      border-radius: 10px;
+      border: 1px solid #dfe7f2;
+      border-radius: 12px;
       background: #ffffff;
-      box-shadow: none;
-      padding: 12px;
+      box-shadow: 0 2px 8px rgba(15, 23, 42, 0.05);
+      padding: var(--space-5);
       position: relative;
       overflow: hidden;
     }
@@ -5665,26 +6723,80 @@ export function mountStyles(): void {
       height: 3px;
       background: linear-gradient(90deg, #f59e0b 0%, #fbbf24 100%);
     }
+    .dash-card-label {
+      margin-bottom: 8px;
+      color: #64748b;
+      font-size: var(--font-sm);
+      font-weight: 600;
+    }
     .dash-card-value {
-      font-size: 22px;
-      color: #111827;
+      font-size: 24px;
+      font-weight: 800;
+      line-height: 1.15;
+      color: #0f172a;
+      letter-spacing: -0.01em;
+    }
+    .dash-section {
+      border: 1px solid #dfe7f2;
+      border-radius: 12px;
+      background: #ffffff;
+      box-shadow: 0 1px 3px rgba(15, 23, 42, 0.04);
+      padding: var(--space-4);
+      margin-bottom: 0;
+    }
+    .dash-section h3 {
+      margin: 0 0 10px 0;
+      color: #0f172a;
+      font-size: 14px;
+      font-weight: 700;
     }
     .dash-table-wrap {
-      border: 1px solid var(--line);
-      border-radius: 8px;
+      border: 1px solid #e2e8f0;
+      border-radius: 10px;
       background: #ffffff;
+      overflow-x: auto;
+    }
+    .dash-table {
+      width: 100%;
+      border-collapse: collapse;
+      font-size: var(--font-sm);
     }
     .dash-table th {
       background: #f8fafc;
       color: #475569;
+      font-size: 11px;
       font-weight: 700;
+      text-transform: uppercase;
+      letter-spacing: 0.03em;
+      position: sticky;
+      top: 0;
+      z-index: 1;
     }
     .dash-table th,
     .dash-table td {
-      border-bottom: 1px solid #e5eaf1;
-      padding: 8px 10px;
+      border-bottom: 1px solid #e7edf5;
+      padding: calc(var(--space-2) + 1px) var(--space-3);
+      text-align: left;
+      vertical-align: top;
     }
-
+    .dash-table tbody tr:hover {
+      background: #f8fbff;
+    }
+    .summary-cell {
+      max-width: 260px;
+      color: #475569;
+      white-space: nowrap;
+      overflow: hidden;
+      text-overflow: ellipsis;
+    }
+    .status-badge {
+      display: inline-block;
+      border-radius: 999px;
+      padding: 2px 8px;
+      font-size: 11px;
+      font-weight: 700;
+      line-height: 1.5;
+    }
     .status-idle { background: #edf2f7; color: #475569; }
     .status-starting { background: #fffbeb; color: #b45309; }
     .status-running { background: #ecfdf3; color: #15803d; }
@@ -5692,16 +6804,112 @@ export function mountStyles(): void {
     .status-stopped { background: #f1f5f9; color: #64748b; }
     .status-error { background: #fef2f2; color: #b91c1c; }
 
+    .log-box {
+      border: 1px solid #e2e8f0;
+      border-radius: 10px;
+      background: #f8fafc;
+      max-height: 320px;
+      overflow: auto;
+      padding: var(--space-3);
+      font-family: "Cascadia Code", "Fira Code", "Consolas", monospace;
+    }
+    .log-line {
+      font-size: 11px;
+      line-height: 1.5;
+      color: #334155;
+      border-bottom: 1px dashed #d8e2ef;
+      padding: 4px 0;
+      word-break: break-all;
+    }
+
+    .sub-tabs {
+      display: inline-flex;
+      align-items: center;
+      gap: var(--space-2);
+      padding: calc(var(--space-1) + 2px);
+      border: 1px solid #dfe7f2;
+      border-radius: 12px;
+      background: #ffffff;
+      width: fit-content;
+      box-shadow: 0 1px 2px rgba(15, 23, 42, 0.04);
+    }
     .sub-tab {
-      border-radius: 8px;
-      border-color: var(--line-strong);
+      border-radius: 9px;
+      border: 1px solid #e2e8f0;
       background: #ffffff;
       color: #475569;
+      padding: var(--space-2) var(--space-4);
+      font-size: var(--font-sm);
+      font-weight: 600;
+    }
+    .sub-tab:hover {
+      border-color: #f2c572;
+      background: #fffaf2;
+      color: #92400e;
     }
     .sub-tab.active {
       border-color: #f2c572;
-      background: #fffaf0;
+      background: #fff4df;
       color: #92400e;
+      box-shadow: 0 1px 3px rgba(245, 158, 11, 0.18);
+    }
+    .sub-content {
+      border: 1px solid #dfe7f2;
+      border-radius: 12px;
+      background: #ffffff;
+      padding: var(--space-4);
+      max-height: 480px;
+      overflow: auto;
+      display: grid;
+      gap: var(--space-3);
+    }
+    .sub-event-item,
+    .sub-chunk-item {
+      border: 1px solid #e2e8f0;
+      border-radius: 10px;
+      background: #f8fbff;
+      padding: var(--space-3);
+      box-shadow: 0 1px 3px rgba(15, 23, 42, 0.03);
+    }
+    .sub-event-head,
+    .sub-chunk-head {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      gap: 10px;
+      margin-bottom: 8px;
+      flex-wrap: wrap;
+    }
+    .sub-event-method,
+    .sub-chunk-participant {
+      color: #0f172a;
+      font-size: 12px;
+      font-weight: 700;
+    }
+    .sub-event-body {
+      margin: 0;
+      border: 1px solid #e2e8f0;
+      border-radius: 8px;
+      background: #ffffff;
+      color: #334155;
+      padding: var(--space-3);
+      font-family: "Cascadia Code", "Fira Code", "Consolas", monospace;
+      font-size: 11px;
+      line-height: 1.5;
+      overflow-x: auto;
+      white-space: pre-wrap;
+      word-break: break-word;
+    }
+    .sub-chunk-body {
+      border: 1px solid #e2e8f0;
+      border-radius: 8px;
+      background: #ffffff;
+      padding: var(--space-3);
+      color: #334155;
+      font-size: var(--font-sm);
+      line-height: 1.55;
+      white-space: pre-wrap;
+      word-break: break-word;
     }
     .badge-active {
       background: #fff7e6;
@@ -6021,6 +7229,779 @@ export function mountStyles(): void {
       .duty-role-picks {
         grid-template-columns: 1fr;
       }
+    }
+
+    :root {
+      color-scheme: dark;
+      --bg: #1e1e1e;
+      --panel: #252526;
+      --panel-soft: #2d2d30;
+      --line: #3c3c3c;
+      --line-strong: #464647;
+      --text: #cccccc;
+      --muted: #9da1a6;
+      --card: #2d2d30;
+      --accent: #0e639c;
+      --accent-strong: #1177bb;
+      --accent-soft: #094771;
+    }
+
+    html,
+    body {
+      background: var(--bg) !important;
+      color: var(--text) !important;
+    }
+
+    #app,
+    .frame,
+    .body,
+    .center,
+    .left-nav,
+    .right-panel,
+    .topbar {
+      background: var(--panel) !important;
+      color: var(--text) !important;
+      border-color: var(--line) !important;
+    }
+
+    .frame {
+      border-color: var(--line-strong) !important;
+      border-radius: 0 !important;
+      min-height: 100vh !important;
+    }
+
+    #app {
+      padding: 0 !important;
+      margin: 0 !important;
+    }
+
+    body {
+      min-height: 100vh !important;
+      overflow: hidden !important;
+    }
+
+    .topbar {
+      border-bottom: 1px solid var(--line-strong) !important;
+      height: 48px !important;
+      min-height: 48px !important;
+      padding: 0 12px 0 14px !important;
+    }
+
+    .brand {
+      gap: 8px !important;
+    }
+
+    .brand-mark {
+      width: 12px;
+      height: 12px;
+      border-radius: 3px;
+      border: 1px solid #2f88c8;
+      background: linear-gradient(135deg, #3794ff 0%, #0e639c 100%);
+      box-shadow: 0 0 0 1px rgba(13, 98, 156, 0.25);
+      flex-shrink: 0;
+    }
+
+    .brand-copy {
+      gap: 1px !important;
+    }
+
+    .brand-text {
+      font-size: 17px !important;
+      font-weight: 700 !important;
+      line-height: 1.05;
+      letter-spacing: 0.1px;
+    }
+
+    .brand-sub {
+      font-size: 10px !important;
+      letter-spacing: 0.2px;
+    }
+
+    .topbar,
+    .topbar * {
+      -webkit-app-region: drag;
+    }
+
+    .topbar-right {
+      display: inline-flex !important;
+      align-items: center !important;
+      gap: 8px !important;
+    }
+
+    .body {
+      grid-template-columns: 212px minmax(0, 1fr) minmax(430px, 36vw) !important;
+    }
+
+    .body.no-right-panel {
+      grid-template-columns: 212px minmax(0, 1fr) !important;
+    }
+
+    .left-nav {
+      background: #1b1d23 !important;
+      border-right: 1px solid #30343a !important;
+      padding: 10px 8px !important;
+    }
+
+    .center {
+      min-width: 0 !important;
+      overflow: auto !important;
+    }
+
+    .right-panel {
+      width: 100% !important;
+      min-width: 380px !important;
+      padding: 14px !important;
+      overflow-y: auto !important;
+      overflow-x: hidden !important;
+    }
+
+    .window-controls {
+      display: inline-flex !important;
+      align-items: center;
+      gap: 6px;
+    }
+
+    .window-control-btn {
+      width: 28px;
+      height: 28px;
+      border: 1px solid var(--line-strong) !important;
+      border-radius: 6px;
+      display: inline-flex;
+      align-items: center;
+      justify-content: center;
+      font-size: 12px;
+      font-weight: 700;
+      line-height: 1;
+      padding: 0;
+      background: #2f2f34 !important;
+      color: #d4d4d4 !important;
+      box-shadow: none !important;
+      cursor: pointer;
+      transition: background-color 120ms ease, border-color 120ms ease, color 120ms ease;
+    }
+
+    .window-control-btn:hover {
+      background: #3b3b41 !important;
+      border-color: #4a4a50 !important;
+      color: #ffffff !important;
+    }
+
+    .window-control-btn.close:hover {
+      background: #c42b1c !important;
+      border-color: #d83b2c !important;
+      color: #ffffff !important;
+    }
+
+    button,
+    input,
+    textarea,
+    select,
+    a,
+    .profile-trigger,
+    .nav-item,
+    .office-card,
+    .flow-plan-card,
+    .provider-card-head,
+    .guide-msg,
+    .message-item,
+    [role="button"] {
+      -webkit-app-region: no-drag;
+    }
+
+    .brand-text,
+    .right-title,
+    .view-title,
+    .office-title,
+    .dash-card-value {
+      color: #ffffff !important;
+    }
+
+    .brand-sub,
+    .right-sub,
+    .muted,
+    .office-meta,
+    .sub-event-meta,
+    .sub-chunk-meta,
+    .dash-card-label,
+    .profile-role,
+    .message-head {
+      color: var(--muted) !important;
+    }
+
+    .nav-group {
+      gap: 2px !important;
+    }
+
+    .nav-item {
+      position: relative;
+      color: #aeb3b9 !important;
+      border: 1px solid transparent !important;
+      border-radius: 6px !important;
+      background: transparent !important;
+      box-shadow: none !important;
+      padding: 9px 10px 9px 18px !important;
+      font-size: 12.5px !important;
+      font-weight: 500 !important;
+      transition: background-color 120ms ease, border-color 120ms ease, color 120ms ease;
+    }
+
+    .nav-item::before {
+      content: "";
+      position: absolute;
+      left: 0;
+      top: 5px;
+      bottom: 5px;
+      width: 3px;
+      border-radius: 2px;
+      background: transparent;
+      transition: background-color 120ms ease;
+    }
+
+    .nav-item:hover {
+      background: #2a2d2f !important;
+      border-color: transparent !important;
+      color: #d6d9de !important;
+    }
+
+    .nav-item.active {
+      background: #31343a !important;
+      border-color: transparent !important;
+      color: #ffffff !important;
+      box-shadow: none !important;
+    }
+
+    .nav-item.active::before {
+      background: #3794ff;
+    }
+
+    .nav-icon {
+      color: #878d94 !important;
+      width: 16px !important;
+      height: 16px !important;
+    }
+
+    .nav-item:hover .nav-icon {
+      color: #d0d4d9 !important;
+    }
+
+    .nav-item.active .nav-icon {
+      color: #4fc1ff !important;
+    }
+
+    .nav-text {
+      letter-spacing: 0.1px;
+      line-height: 1.1;
+    }
+
+    .nav-bottom {
+      border-top: 1px solid #30343a;
+      padding-top: 10px;
+    }
+
+    .profile {
+      border: 1px solid #34373d !important;
+      border-radius: 8px !important;
+      background: #25282f !important;
+      box-shadow: none !important;
+    }
+
+    .profile-avatar {
+      width: 24px !important;
+      height: 24px !important;
+      border-radius: 6px !important;
+      border: 1px solid #3f454e !important;
+      background: #1f2228 !important;
+      color: #d0d6de !important;
+    }
+
+    .engine-status {
+      display: inline-flex !important;
+      align-items: center !important;
+      gap: 7px !important;
+      height: 26px !important;
+      padding: 0 10px !important;
+      border: 1px solid #3f4650 !important;
+      border-radius: 4px !important;
+      background: #2f343d !important;
+      color: #cfd5dd !important;
+      font-size: 12px !important;
+      font-weight: 600 !important;
+      letter-spacing: 0.15px;
+      box-shadow: none !important;
+      line-height: 1;
+    }
+
+    .engine-dot {
+      width: 7px !important;
+      height: 7px !important;
+      border-radius: 999px !important;
+      background: #7f8691 !important;
+      box-shadow: 0 0 0 1px rgba(127, 134, 145, 0.3) !important;
+      flex-shrink: 0;
+    }
+
+    .engine-status.online {
+      color: #ffffff !important;
+      border-color: #007acc !important;
+      background: #007acc !important;
+    }
+
+    .engine-status.online .engine-dot {
+      background: #ffffff !important;
+      box-shadow: 0 0 0 1px rgba(255, 255, 255, 0.35) !important;
+    }
+
+    .engine-status.offline {
+      color: #c2c8cf !important;
+      border-color: #434a54 !important;
+      background: #323841 !important;
+    }
+
+    .card,
+    .discussion-box,
+    .message-item,
+    .member-editor,
+    .member-row,
+    .provider-card,
+    .dash-section,
+    .dash-card,
+    .global-api-card,
+    .sub-event-item,
+    .sub-chunk-item,
+    .flow-section,
+    .flow-plan-card,
+    .profile-user-card,
+    .profile-api-card,
+    .profile-settings-body,
+    .profile-api-editor-body,
+    .guide-msg {
+      background: var(--panel-soft) !important;
+      color: var(--text) !important;
+      border-color: var(--line) !important;
+      box-shadow: none !important;
+      border-radius: 8px !important;
+    }
+
+    .office-card,
+    .office-card.add,
+    .member-editor-row,
+    .provider-card-head,
+    .flow-modal,
+    .guide-modal,
+    .profile-settings-modal,
+    .profile-api-editor-modal {
+      border-radius: 8px !important;
+    }
+
+    .guide-structured {
+      margin-top: 8px;
+      display: grid;
+      gap: 8px;
+    }
+
+    .guide-structured-card {
+      border: 1px solid #3b4149;
+      border-radius: 8px;
+      background: #242830;
+      padding: 8px 10px;
+    }
+
+    .guide-structured-title {
+      font-size: 12px;
+      font-weight: 700;
+      color: #dbe8ff;
+      margin-bottom: 6px;
+      letter-spacing: 0.15px;
+      text-transform: uppercase;
+    }
+
+    .guide-structured-list {
+      margin: 0;
+      padding-left: 16px;
+      display: grid;
+      gap: 4px;
+      font-size: 12px;
+      line-height: 1.5;
+      color: #c8d0da;
+    }
+
+    .guide-msg-actions {
+      margin-top: 8px;
+      display: flex;
+      gap: 8px;
+      flex-wrap: wrap;
+    }
+
+    .guide-msg-action {
+      border: 1px solid #4a525c !important;
+      border-radius: 6px !important;
+      background: #313844 !important;
+      color: #d7e2ef !important;
+      font-size: 12px !important;
+      font-weight: 600 !important;
+      padding: 6px 10px !important;
+      box-shadow: none !important;
+    }
+
+    .guide-msg-action:hover {
+      border-color: #007acc !important;
+      background: #1f334a !important;
+      color: #ffffff !important;
+    }
+
+    .guide-msg-role,
+    .flow-section-title,
+    .flow-plan-title,
+    .flow-plan-summary,
+    .flow-preview-role,
+    .flow-preview-provider,
+    .flow-preview-model,
+    .sub-event-method,
+    .sub-chunk-participant {
+      color: #d7dde6 !important;
+    }
+
+    .flow-plan-meta,
+    .sub-event-time,
+    .sub-chunk-meta {
+      color: #a8adb4 !important;
+    }
+
+    .sub-tabs {
+      border-color: var(--line) !important;
+      background: #252526 !important;
+      box-shadow: none !important;
+    }
+
+    .sub-tab {
+      border-color: #3a3d41 !important;
+      background: #2d2d30 !important;
+      color: #b9bdc3 !important;
+      box-shadow: none !important;
+    }
+
+    .sub-tab:hover {
+      border-color: #4b4f55 !important;
+      background: #35363b !important;
+      color: #ffffff !important;
+    }
+
+    .sub-tab.active {
+      border-color: #007acc !important;
+      background: #1f3348 !important;
+      color: #eaf4ff !important;
+      box-shadow: none !important;
+    }
+
+    .dash-card::before {
+      background: linear-gradient(90deg, #0e639c 0%, #3794ff 100%) !important;
+      opacity: 0.9;
+    }
+
+    .guide-structured-actions {
+      margin-top: 4px;
+      display: flex;
+      justify-content: flex-start;
+    }
+
+    .guide-structured-apply {
+      border-color: #007acc !important;
+      background: #0e639c !important;
+      color: #ffffff !important;
+    }
+
+    .guide-structured-apply:hover {
+      border-color: #3794ff !important;
+      background: #1177bb !important;
+    }
+
+    .member-list,
+    .member-row,
+    .member-editor,
+    .member-editor-title,
+    .member-editor-row,
+    .member-editor-row label,
+    .member-editor-row b,
+    .member-editor-row span,
+    .member-editor-row p,
+    .member-row b,
+    .member-row span,
+    .member-row p {
+      background: var(--panel-soft) !important;
+      color: var(--text) !important;
+      border-color: var(--line) !important;
+    }
+
+    .member-editor {
+      min-width: 0 !important;
+      overflow: hidden !important;
+    }
+
+    .member-editor-row {
+      display: grid !important;
+      grid-template-columns: 78px minmax(0, 1.1fr) minmax(115px, 0.9fr) minmax(138px, 1fr) minmax(145px, 1fr) minmax(175px, 1.2fr) !important;
+      gap: 8px !important;
+      align-items: center !important;
+      min-width: 0 !important;
+      width: 100% !important;
+    }
+
+    .member-editor-row .check {
+      display: inline-flex !important;
+      width: 100% !important;
+      min-width: 0 !important;
+      white-space: nowrap;
+    }
+
+    .member-editor-row > input,
+    .member-editor-row > select {
+      min-width: 0 !important;
+      width: 100% !important;
+    }
+
+    @media (max-width: 1520px) {
+      .body {
+        grid-template-columns: 206px minmax(0, 1fr) minmax(360px, 34vw) !important;
+      }
+
+      .member-editor-row {
+        grid-template-columns: 78px minmax(0, 1fr) minmax(100px, 0.9fr) minmax(120px, 0.95fr) minmax(130px, 1fr) minmax(145px, 1.05fr) !important;
+      }
+    }
+
+    @media (max-width: 1280px) {
+      .body,
+      .body.no-right-panel {
+        grid-template-columns: 1fr !important;
+      }
+
+      .right-panel {
+        min-width: 0 !important;
+      }
+
+      .member-editor-row {
+        grid-template-columns: 82px minmax(0, 1fr) !important;
+      }
+    }
+
+    .member-row span,
+    .member-editor-title,
+    .profile-api-title,
+    .profile-user-name {
+      color: #d7e9ff !important;
+    }
+
+    .flow-modal,
+    .flow-modal-head,
+    .flow-modal-foot,
+    .profile-settings-modal,
+    .profile-settings-mask,
+    .profile-api-editor-mask,
+    .profile-api-editor-modal,
+    .guide-modal,
+    .guide-mask {
+      background: var(--panel) !important;
+      color: var(--text) !important;
+      border-color: var(--line) !important;
+    }
+
+    .flow-modal-mask,
+    .profile-settings-mask,
+    .profile-api-editor-mask,
+    .guide-mask {
+      background: rgba(0, 0, 0, 0.55) !important;
+    }
+
+    .profile-api-empty,
+    .profile-api-empty-add,
+    .profile-api-add-btn,
+    .profile-api-activate,
+    .profile-api-edit,
+    .profile-api-remove,
+    .sub-event-item,
+    .sub-chunk-item,
+    .sub-event-body,
+    .sub-chunk-body,
+    .dash-table,
+    .dash-table thead,
+    .dash-table tbody,
+    .dash-table tr,
+    .dash-table td,
+    .dash-table th {
+      background: var(--panel-soft) !important;
+      color: var(--text) !important;
+      border-color: var(--line) !important;
+    }
+
+    .dash-table tbody tr:hover,
+    .sub-event-item:hover,
+    .sub-chunk-item:hover {
+      background: #35353a !important;
+    }
+
+    .toast,
+    .toast-info,
+    .toast-success,
+    .toast-error {
+      background: #2f2f34 !important;
+      color: var(--text) !important;
+      border-color: var(--line-strong) !important;
+    }
+
+    .office-card {
+      background: var(--panel-soft) !important;
+      border-color: var(--line) !important;
+      color: var(--text) !important;
+    }
+
+    .office-card:hover {
+      border-color: var(--accent) !important;
+      background: #333337 !important;
+    }
+
+    .office-card.active {
+      border-color: var(--accent) !important;
+      background: #1f2b34 !important;
+    }
+
+    .office-card.add {
+      background: #1f2b34 !important;
+      border-color: #2f6f95 !important;
+      color: #4fc1ff !important;
+    }
+
+    .provider-card-head,
+    .flow-plan-card {
+      background: var(--panel-soft) !important;
+      border-color: var(--line) !important;
+      color: var(--text) !important;
+    }
+
+    .flow-plan-card.active,
+    .global-api-card-active {
+      background: #1f2b34 !important;
+      border-color: var(--accent) !important;
+    }
+
+    input,
+    textarea,
+    select,
+    #guide-input,
+    #human-input,
+    #workflow-script {
+      background: #1e1e1e !important;
+      color: var(--text) !important;
+      border-color: var(--line-strong) !important;
+    }
+
+    input::placeholder,
+    textarea::placeholder {
+      color: #808080 !important;
+    }
+
+    input:focus-visible,
+    textarea:focus-visible,
+    select:focus-visible,
+    button:focus-visible {
+      border-color: #3794ff !important;
+      outline: 1px solid #3794ff !important;
+      outline-offset: 0;
+    }
+
+    button {
+      background: #3c3c3c !important;
+      color: var(--text) !important;
+      border-color: var(--line-strong) !important;
+    }
+
+    button:hover {
+      background: #4a4a4a !important;
+      border-color: #5a5a5a !important;
+    }
+
+    #btn-start-office,
+    #btn-send-human,
+    #btn-set-keys,
+    #btn-flow-create,
+    #btn-guide-send,
+    #btn-guide-create,
+    #btn-flow-sync-keys,
+    #btn-settings-sync-global,
+    #btn-settings-import-global,
+    .btn-sm.primary {
+      background: var(--accent) !important;
+      border-color: var(--accent) !important;
+      color: #ffffff !important;
+      box-shadow: none !important;
+    }
+
+    #btn-start-office:hover,
+    #btn-send-human:hover,
+    #btn-set-keys:hover,
+    #btn-flow-create:hover,
+    #btn-guide-send:hover,
+    #btn-guide-create:hover,
+    #btn-flow-sync-keys:hover,
+    #btn-settings-sync-global:hover,
+    #btn-settings-import-global:hover,
+    .btn-sm.primary:hover {
+      background: #1177bb !important;
+      border-color: #1177bb !important;
+    }
+
+    #btn-stop-office,
+    .danger,
+    .btn-sm.btn-danger {
+      background: #5a1d1d !important;
+      border-color: #8b2d2d !important;
+      color: #f48771 !important;
+    }
+
+    #btn-stop-office:hover,
+    .btn-sm.btn-danger:hover {
+      background: #733030 !important;
+      border-color: #a33f3f !important;
+    }
+
+    .status-idle {
+      background: #3c3c3c !important;
+      color: #d4d4d4 !important;
+    }
+
+    .status-starting {
+      background: #2f3d4d !important;
+      color: #b9d9ff !important;
+    }
+
+    .status-running {
+      background: #1f4b3a !important;
+      color: #89d185 !important;
+    }
+
+    .status-completed {
+      background: #1f3f5b !important;
+      color: #75beff !important;
+    }
+
+    .status-stopped {
+      background: #3b3b3b !important;
+      color: #a6a6a6 !important;
+    }
+
+    .status-error {
+      background: #5a1d1d !important;
+      color: #f48771 !important;
+    }
+
+    .md-body code,
+    .md-body pre {
+      background: #1e1e1e !important;
+      color: #d4d4d4 !important;
+      border-color: var(--line) !important;
+    }
+
+    .md-body a {
+      color: #4fc1ff !important;
     }
   `;
   document.head.appendChild(style);

@@ -34,6 +34,42 @@ impl Default for OrchestratorState {
 
 type SharedState = Mutex<OrchestratorState>;
 
+async fn reject_all_pending(
+    pending: &tokio::sync::Mutex<
+        std::collections::HashMap<u64, tokio::sync::oneshot::Sender<Result<Value, String>>>,
+    >,
+    reason: &str,
+) {
+    let mut map = pending.lock().await;
+    if map.is_empty() {
+        return;
+    }
+
+    let message = reason.to_string();
+    for (_, sender) in map.drain() {
+        let _ = sender.send(Err(message.clone()));
+    }
+}
+
+async fn mark_orchestrator_stopped(app_handle: &AppHandle, reason: &str) {
+    let state: State<'_, SharedState> = app_handle.state();
+    let mut guard = state.lock().await;
+    guard.child = None;
+    guard.stdin = None;
+    reject_all_pending(&guard.pending, reason).await;
+}
+
+fn orchestrator_runtime_dir(exe_path: &PathBuf) -> PathBuf {
+    exe_path
+        .parent()
+        .map(PathBuf::from)
+        .unwrap_or_else(|| PathBuf::from("."))
+}
+
+fn orchestrator_memory_db_path(runtime_dir: &PathBuf) -> PathBuf {
+    runtime_dir.join("orchestrator-memory.db")
+}
+
 // ─── 辅助：查找 orchestrator 可执行文件 ──────────────────────────
 
 fn find_orchestrator_exe() -> Option<PathBuf> {
@@ -141,14 +177,28 @@ async fn start_orchestrator(
     if let Some(ref mut child) = guard.child {
         let _ = child.kill().await;
     }
+    guard.child = None;
+    guard.stdin = None;
+    reject_all_pending(&guard.pending, "orchestrator restarted").await;
 
     let exe_path = find_orchestrator_exe().ok_or_else(|| {
         "orchestrator binary not found. Run 'cargo build -p orchestrator' first.".to_string()
     })?;
 
+    let runtime_dir = orchestrator_runtime_dir(&exe_path);
+    let memory_db_path = std::env::var_os("ORCH_MEMORY_SQLITE_PATH")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| orchestrator_memory_db_path(&runtime_dir));
+
     eprintln!("[studio] Starting orchestrator: {:?}", exe_path);
+    eprintln!(
+        "[studio] Orchestrator runtime_dir={:?}, memory_db={:?}",
+        runtime_dir, memory_db_path
+    );
 
     let mut child = Command::new(&exe_path)
+        .current_dir(&runtime_dir)
+        .env("ORCH_MEMORY_SQLITE_PATH", &memory_db_path)
         .stdin(std::process::Stdio::piped())
         .stdout(std::process::Stdio::piped())
         .stderr(std::process::Stdio::piped())
@@ -188,12 +238,18 @@ async fn start_orchestrator(
                 match reader.read_line(&mut header_buf).await {
                     Ok(0) => {
                         eprintln!("[studio] orchestrator stdout closed");
+                        mark_orchestrator_stopped(&app_handle, "orchestrator stdout closed").await;
                         let _ = app_handle.emit("orchestrator-exit", ());
                         return;
                     }
                     Ok(_) => {}
                     Err(e) => {
                         eprintln!("[studio] stdout read error: {e}");
+                        mark_orchestrator_stopped(
+                            &app_handle,
+                            &format!("orchestrator stdout read error: {e}"),
+                        )
+                        .await;
                         let _ = app_handle.emit("orchestrator-exit", ());
                         return;
                     }
@@ -294,11 +350,6 @@ async fn send_rpc(
     // 先获取 id（不可变借用），再获取 stdin（可变借用），避免借用冲突
     let id = guard.next_id.fetch_add(1, Ordering::SeqCst);
 
-    let stdin = guard
-        .stdin
-        .as_mut()
-        .ok_or("Orchestrator not running. Call start_orchestrator first.")?;
-
     let request = serde_json::json!({
         "jsonrpc": "2.0",
         "id": id,
@@ -308,11 +359,23 @@ async fn send_rpc(
 
     let payload = serde_json::to_vec(&request).map_err(|e| format!("JSON serialize error: {e}"))?;
 
-    write_rpc_message(stdin, &payload).await?;
-
     // 创建 oneshot channel 等待响应
     let (tx, rx) = tokio::sync::oneshot::channel();
     guard.pending.lock().await.insert(id, tx);
+
+    let write_err = {
+        let stdin = guard
+            .stdin
+            .as_mut()
+            .ok_or("Orchestrator not running. Call start_orchestrator first.")?;
+
+        write_rpc_message(stdin, &payload).await.err()
+    };
+
+    if let Some(err) = write_err {
+        guard.pending.lock().await.remove(&id);
+        return Err(err);
+    }
 
     // 释放锁，等待响应
     drop(guard);
@@ -320,8 +383,16 @@ async fn send_rpc(
     // 等待响应（超时 180 秒，兼容高思考模型）
     match tokio::time::timeout(std::time::Duration::from_secs(180), rx).await {
         Ok(Ok(result)) => result,
-        Ok(Err(_)) => Err("Response channel closed".to_string()),
-        Err(_) => Err("RPC request timed out (180s)".to_string()),
+        Ok(Err(_)) => {
+            let guard = state.lock().await;
+            guard.pending.lock().await.remove(&id);
+            Err("Response channel closed".to_string())
+        }
+        Err(_) => {
+            let guard = state.lock().await;
+            guard.pending.lock().await.remove(&id);
+            Err("RPC request timed out (180s)".to_string())
+        }
     }
 }
 
@@ -335,6 +406,7 @@ async fn stop_orchestrator(state: State<'_, SharedState>) -> Result<RpcResult, S
     }
     guard.child = None;
     guard.stdin = None;
+    reject_all_pending(&guard.pending, "orchestrator stopped").await;
 
     Ok(RpcResult {
         success: true,
@@ -346,8 +418,30 @@ async fn stop_orchestrator(state: State<'_, SharedState>) -> Result<RpcResult, S
 /// 检查 orchestrator 是否在运行
 #[tauri::command]
 async fn orchestrator_status(state: State<'_, SharedState>) -> Result<RpcResult, String> {
-    let guard = state.lock().await;
-    let running = guard.child.is_some();
+    let mut guard = state.lock().await;
+
+    let mut cleanup_reason: Option<String> = None;
+    let running = if let Some(child) = guard.child.as_mut() {
+        match child.try_wait() {
+            Ok(Some(status)) => {
+                cleanup_reason = Some(format!("orchestrator exited: {status}"));
+                false
+            }
+            Ok(None) => true,
+            Err(err) => {
+                cleanup_reason = Some(format!("orchestrator status check failed: {err}"));
+                false
+            }
+        }
+    } else {
+        false
+    };
+
+    if let Some(reason) = cleanup_reason {
+        guard.child = None;
+        guard.stdin = None;
+        reject_all_pending(&guard.pending, &reason).await;
+    }
 
     Ok(RpcResult {
         success: true,

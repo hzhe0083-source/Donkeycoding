@@ -321,7 +321,11 @@ export function openGuideFlow(): void {
   guideFlow.sessionId = "";
 
   // AI 主动打招呼
-  pushGuideMessage("ai", "👋 你好！我是你的 Workerflow 助手。\n\n告诉我你想让 AI 团队帮你完成什么任务？\n比如：\n• 帮我做一个技术方案评审\n• 写一份产品需求文档\n• 分析竞品并给出建议\n\n请描述你的目标，我来帮你组建最合适的 AI 办公室 🏢", []);
+  pushGuideMessage(
+    "ai",
+    "总，今天想要干什么？\n\n你可以直接说：‘我想仿照一个京东集团的商城项目。’\n\n我会先召集你当前可用的 API 团队，给每个成员分配职责（工程师/前端/数学家/测试/产品经理），先共创项目企划与 workflow，再请你拍板是否创建办公室并开工。",
+    [],
+  );
 }
 
 export function closeGuideFlow(): void {

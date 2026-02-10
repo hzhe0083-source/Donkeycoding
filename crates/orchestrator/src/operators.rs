@@ -1,7 +1,11 @@
-use crate::types::*;
+﻿use crate::types::*;
 use serde_json::Value;
 use std::cmp::Ordering;
 use std::collections::HashMap;
+use std::env;
+
+const GUIDE_COLLAB_ENV_KEY: &str = "WORKERFLOW_GUIDE_COLLAB_PROMPT";
+const DEFAULT_GUIDE_COLLAB_PROMPT: &str = "[Guide Collaboration Protocol]\nYou are in a multi-person group chat with the user and other teammates. Treat every other participant as a real human colleague.\nYou must explicitly show your role identity at the beginning of each response, and keep that role consistent.\nYou must quote at least one concrete point from a previous participant before adding your own view.\nYou must reference long-term shared memory if relevant, and state whether the memory is still valid, needs update, or should be corrected.\nWhen new stable facts/decisions appear, output a section named [Memory Update] with 1-3 concise bullets for shared long-term memory.\nAvoid rushing to a final conclusion; focus on evidence, disagreements, and a testable next step.\nPreferred structure: Role Identity -> Quoted Context -> Analysis -> Memory Check -> Next Action.";
 
 pub struct TurnContext {
     pub task: String,
@@ -65,6 +69,7 @@ impl OperatorRegistry {
         registry.register(ContextWindowOperator);
         registry.register(ParticipantSelectorOperator);
         registry.register(RoleResponseFormatOperator);
+        registry.register(GuideCollaborationOperator);
         registry.register(ReviewInstructionOperator);
         registry.register(ReviewFindingsNormalizerOperator);
         registry.register(OutputGuardOperator);
@@ -130,6 +135,47 @@ fn config_str_list(config: &Value, key: &str) -> Vec<String> {
         .unwrap_or_default()
 }
 
+fn config_string(config: &Value, key: &str) -> Option<String> {
+    let value = config.get(key).and_then(Value::as_str)?.trim();
+    if value.is_empty() {
+        return None;
+    }
+    Some(value.to_string())
+}
+
+fn guide_collaboration_instruction(config: &Value) -> String {
+    if let Some(instruction) = config_string(config, "instruction") {
+        return instruction;
+    }
+
+    if let Ok(instruction) = env::var(GUIDE_COLLAB_ENV_KEY) {
+        let trimmed = instruction.trim();
+        if !trimmed.is_empty() {
+            return trimmed.to_string();
+        }
+    }
+
+    let mut instruction = DEFAULT_GUIDE_COLLAB_PROMPT.to_string();
+
+    if let Some(leader_participant_id) = config_string(config, "leader_participant_id") {
+        instruction.push_str("\n\n[Leadership Rule]\n");
+        instruction.push_str(
+            &format!(
+                "Participant {leader_participant_id} is the user-intent leader. This leader proposes requirements and plan skeleton on behalf of the user. Other participants must evaluate feasibility, risks, missing details, and implementation quality against the leader's proposal."
+            ),
+        );
+    }
+
+    if config_bool(config, "require_visible_reasoning_path", false) {
+        instruction.push_str("\n\n[Visible Discussion Path]\n");
+        instruction.push_str(
+            "Expose concise reasoning path directly in your answer instead of hidden thinking. Include: current objective, key assumptions, argument chain, and why your next step is chosen.",
+        );
+    }
+
+    instruction
+}
+
 fn normalize_message(input: &str) -> String {
     let mut lines = Vec::new();
     let mut last_empty = false;
@@ -171,7 +217,7 @@ impl TurnOperator for SanitizeInputOperator {
         }
 
         if message.trim().is_empty() {
-            message = "请基于上下文继续讨论。".to_string();
+            message = "Please continue the discussion based on context.".to_string();
         }
 
         ctx.user_message = message.clone();
@@ -287,12 +333,24 @@ impl TurnOperator for RoleResponseFormatOperator {
 
             if include_checklist {
                 let checklist = match participant.role {
-                    Role::Proposer => "请按以下结构输出：\n1) 方案要点\n2) 实施步骤\n3) 主要风险",
-                    Role::Critic => "请按以下结构输出：\n1) 问题清单\n2) 风险等级\n3) 修正建议",
-                    Role::Synthesizer => "请按以下结构输出：\n1) 共识\n2) 分歧\n3) 折中方案",
-                    Role::Arbiter => "请按以下结构输出：\n1) 最终结论\n2) 决策依据\n3) 后续动作",
-                    Role::Researcher => "请按以下结构输出：\n1) 证据\n2) 可信度\n3) 对方案影响",
-                    Role::Verifier => "请按以下结构输出：\n1) 校验结论\n2) 边界条件\n3) 待补充项",
+                    Role::Proposer => {
+                        "Please output:\n1) Proposal summary\n2) Execution steps\n3) Main risks"
+                    }
+                    Role::Critic => {
+                        "Please output:\n1) Issue list\n2) Risk level\n3) Improvement suggestions"
+                    }
+                    Role::Synthesizer => {
+                        "Please output:\n1) Consensus\n2) Disagreements\n3) Unified proposal"
+                    }
+                    Role::Arbiter => {
+                        "Please output:\n1) Final decision\n2) Rationale\n3) Follow-up actions"
+                    }
+                    Role::Researcher => {
+                        "Please output:\n1) Evidence\n2) Confidence\n3) Impact on proposal"
+                    }
+                    Role::Verifier => {
+                        "Please output:\n1) Validation result\n2) Boundary conditions\n3) Open items"
+                    }
                 };
                 suffix.push_str(checklist);
             }
@@ -301,7 +359,7 @@ impl TurnOperator for RoleResponseFormatOperator {
                 if !suffix.is_empty() {
                     suffix.push_str("\n\n");
                 }
-                suffix.push_str("输出 JSON 对象，字段：summary, steps, risks, confidence。");
+                suffix.push_str("Output a JSON object with fields: summary, steps, risks, confidence.");
             }
 
             if !suffix.is_empty() {
@@ -340,6 +398,40 @@ impl TurnOperator for OutputGuardOperator {
     }
 }
 
+struct GuideCollaborationOperator;
+
+impl TurnOperator for GuideCollaborationOperator {
+    fn name(&self) -> &'static str {
+        "guide_collaboration"
+    }
+
+    fn apply_before(&self, ctx: &mut TurnContext, config: &Value) {
+        let enabled = config_bool(config, "enabled", true);
+        if !enabled {
+            return;
+        }
+
+        let instruction = guide_collaboration_instruction(config);
+
+        for participant in &ctx.participants {
+            let mut suffix = ctx
+                .prompt_suffix_by_participant
+                .get(&participant.participant_id)
+                .cloned()
+                .unwrap_or_default();
+
+            if !suffix.is_empty() {
+                suffix.push_str("\n\n");
+            }
+
+            suffix.push_str(&instruction);
+
+            ctx.prompt_suffix_by_participant
+                .insert(participant.participant_id.clone(), suffix);
+        }
+    }
+}
+
 struct ReviewInstructionOperator;
 
 impl TurnOperator for ReviewInstructionOperator {
@@ -362,17 +454,17 @@ impl TurnOperator for ReviewInstructionOperator {
                 suffix.push_str("\n\n");
             }
 
-            suffix.push_str("你正在执行代码审核任务。请优先给出可执行、可验证的问题与修复建议。");
+            suffix.push_str("You are performing a code/workflow review. Prioritize actionable and verifiable findings.");
 
             if include_severity {
-                suffix.push_str("\n每条问题都要标注严重级别：LOW/MEDIUM/HIGH/CRITICAL。");
+                suffix.push_str("\nMark severity for each finding: LOW/MEDIUM/HIGH/CRITICAL.");
             }
 
             if include_evidence {
-                suffix.push_str("\n每条问题都需要给出证据（代码片段、行为说明或复现线索）。");
+                suffix.push_str("\nProvide evidence for each finding (code snippet, behavior, or reproduction clue).");
             }
 
-            suffix.push_str("\n输出建议格式：- [SEVERITY] title | evidence | suggestion");
+            suffix.push_str("\n杈撳嚭寤鸿鏍煎紡锛? [SEVERITY] title | evidence | suggestion");
 
             ctx.prompt_suffix_by_participant
                 .insert(participant.participant_id.clone(), suffix);

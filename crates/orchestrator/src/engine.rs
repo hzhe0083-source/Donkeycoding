@@ -1,4 +1,5 @@
 use crate::adapter::LlmAdapter;
+use crate::memory::{build_memory_store, MemoryHit, MemoryQuery, MemoryRecord, MemorySettings, NoopMemoryStore};
 use crate::operators::{OperatorRegistry, TurnContext};
 use crate::types::*;
 use reqwest::Method;
@@ -19,15 +20,41 @@ pub struct Engine {
     pub sessions: HashMap<String, SessionState>,
     event_seq: u64,
     operators: OperatorRegistry,
+    memory_settings: MemorySettings,
+    memory_store: Box<dyn crate::memory::MemoryStore>,
 }
 
 impl Engine {
     pub fn new(api_keys: ApiKeys) -> Self {
+        let memory_settings = MemorySettings::from_env();
+        let memory_store = match build_memory_store(&memory_settings) {
+            Ok(store) => {
+                if memory_settings.enabled {
+                    eprintln!(
+                        "[engine] Memory enabled: backend={}, namespace={}, sqlite_path={}, embed_provider={}, embed_model={}, qdrant_collection={}",
+                        memory_settings.backend,
+                        memory_settings.namespace,
+                        memory_settings.sqlite_path,
+                        memory_settings.embedding.provider,
+                        memory_settings.embedding.model,
+                        memory_settings.qdrant.collection,
+                    );
+                }
+                store
+            }
+            Err(err) => {
+                eprintln!("[engine] Memory init failed, fallback to noop: {err}");
+                Box::new(NoopMemoryStore)
+            }
+        };
+
         Self {
             adapter: LlmAdapter::new(api_keys),
             sessions: HashMap::new(),
             event_seq: 0,
             operators: OperatorRegistry::new(),
+            memory_settings,
+            memory_store,
         }
     }
 
@@ -76,7 +103,11 @@ impl Engine {
         };
 
         self.sessions.insert(session_id.clone(), session);
-        self.sessions.get(&session_id).expect("session inserted")
+        if let Some(session_ref) = self.sessions.get(&session_id) {
+            session_ref
+        } else {
+            panic!("session insert failed unexpectedly: {session_id}");
+        }
     }
 
     pub fn get_session_mut(&mut self, session_id: &str) -> Option<&mut SessionState> {
@@ -195,9 +226,30 @@ impl Engine {
             .map(|message| message.content.clone())
             .unwrap_or_else(|| task.clone());
 
+        let recalled_memories = self.recall_memories(&user_message);
+        let recalled_memory_context = if recalled_memories.is_empty() {
+            None
+        } else {
+            Some(format_memory_context(&recalled_memories))
+        };
+
         let mut turn_context = TurnContext::new(task, user_message, history, participants);
         self.operators
             .apply_before(&operator_chain, &mut turn_context);
+
+        if let Some(memory_context) = recalled_memory_context {
+            for participant in &turn_context.participants {
+                let entry = turn_context
+                    .prompt_suffix_by_participant
+                    .entry(participant.participant_id.clone())
+                    .or_default();
+                if !entry.trim().is_empty() {
+                    entry.push_str("\n\n");
+                }
+                entry.push_str(&memory_context);
+            }
+            turn_context.trace.push("before:memory_recall".to_string());
+        }
 
         let mut ordered_participants = turn_context.participants.clone();
         ordered_participants.sort_by(|left, right| match left.priority.cmp(&right.priority) {
@@ -301,12 +353,19 @@ impl Engine {
         };
 
         let mut progress_snapshot: Option<(u64, f64)> = None;
+        let mut memory_records: Vec<MemoryRecord> = Vec::new();
 
         if let Some(session) = self.sessions.get_mut(session_id) {
             session.current_turn = turn_index;
             session.turns.push(turn_result.clone());
 
-            for output in &session.turns.last().expect("turn exists").outputs {
+            let latest_outputs = session
+                .turns
+                .last()
+                .map(|turn| &turn.outputs)
+                .ok_or_else(|| format!("missing latest turn after push for session {session_id}"))?;
+
+            for output in latest_outputs {
                 session.total_tokens += output.tokens_used.total_tokens;
                 session.total_cost += output.cost_estimate;
             }
@@ -316,6 +375,28 @@ impl Engine {
                     role: "assistant".to_string(),
                     content: content.clone(),
                     participant_id: Some(participant_id.clone()),
+                });
+
+                memory_records.push(MemoryRecord {
+                    session_id: Some(session_id.to_string()),
+                    source: format!("assistant:{participant_id}"),
+                    text: content.clone(),
+                });
+
+                for update in extract_memory_updates(content, 3) {
+                    memory_records.push(MemoryRecord {
+                        session_id: Some(session_id.to_string()),
+                        source: format!("memory_update:{participant_id}"),
+                        text: update,
+                    });
+                }
+            }
+
+            if !turn_context.user_message.trim().is_empty() {
+                memory_records.push(MemoryRecord {
+                    session_id: Some(session_id.to_string()),
+                    source: "user".to_string(),
+                    text: turn_context.user_message.clone(),
                 });
             }
 
@@ -327,7 +408,7 @@ impl Engine {
             session.last_review = build_review_report(
                 &session.review,
                 turn_index,
-                &session.turns.last().expect("turn exists").outputs,
+                latest_outputs,
             );
 
             progress_snapshot = Some((session.total_tokens, session.total_cost));
@@ -349,6 +430,8 @@ impl Engine {
                 }),
             );
         }
+
+        self.persist_memories(memory_records);
 
         Ok(turn_result)
     }
@@ -839,6 +922,37 @@ impl Engine {
     }
 }
 
+impl Engine {
+    fn recall_memories(&self, user_message: &str) -> Vec<MemoryHit> {
+        let query = MemoryQuery {
+            namespace: self.memory_settings.namespace.clone(),
+            text: user_message.to_string(),
+            top_k: self.memory_settings.top_k,
+            min_score: self.memory_settings.min_score,
+            max_candidates: self.memory_settings.max_candidates,
+        };
+
+        match self.memory_store.search(&query) {
+            Ok(hits) => hits,
+            Err(err) => {
+                eprintln!("[engine] memory search failed: {err}");
+                Vec::new()
+            }
+        }
+    }
+
+    fn persist_memories(&self, records: Vec<MemoryRecord>) {
+        for record in records {
+            if let Err(err) = self
+                .memory_store
+                .put(&self.memory_settings.namespace, record)
+            {
+                eprintln!("[engine] memory put failed: {err}");
+            }
+        }
+    }
+}
+
 impl Role {
     pub fn label(&self) -> &'static str {
         match self {
@@ -1021,6 +1135,70 @@ fn truncate_text(text: &str, max_chars: usize) -> String {
         out.push(ch);
     }
     out
+}
+
+fn format_memory_context(hits: &[MemoryHit]) -> String {
+    let mut lines = vec![
+        "[Shared Long-Term Memory] Relevant prior facts and decisions for all participants:".to_string(),
+    ];
+
+    for (index, hit) in hits.iter().enumerate() {
+        lines.push(format!(
+            "{}. ({}, score={:.2}) {}",
+            index + 1,
+            hit.source,
+            hit.score,
+            truncate_text(&hit.text, 220).replace('\n', " ")
+        ));
+    }
+
+    lines.join("\n")
+}
+
+fn extract_memory_updates(content: &str, max_items: usize) -> Vec<String> {
+    if max_items == 0 {
+        return Vec::new();
+    }
+
+    let lower = content.to_lowercase();
+    let marker_index = lower.find("[memory update]");
+    let Some(start) = marker_index else {
+        return Vec::new();
+    };
+
+    let section = &content[start..];
+    let mut updates = Vec::new();
+
+    for line in section.lines().skip(1) {
+        let trimmed = line.trim();
+        if trimmed.is_empty() {
+            if !updates.is_empty() {
+                break;
+            }
+            continue;
+        }
+
+        if trimmed.starts_with('[') && trimmed.ends_with(']') {
+            break;
+        }
+
+        let normalized = trimmed
+            .trim_start_matches('-')
+            .trim_start_matches('*')
+            .trim_start_matches(|ch: char| ch.is_ascii_digit() || ch == '.' || ch == ')' || ch == ' ')
+            .trim();
+
+        if normalized.is_empty() {
+            continue;
+        }
+
+        updates.push(normalized.to_string());
+        if updates.len() >= max_items {
+            break;
+        }
+    }
+
+    updates
 }
 
 fn build_workflow_summary(results: &[WorkflowStepResult]) -> String {

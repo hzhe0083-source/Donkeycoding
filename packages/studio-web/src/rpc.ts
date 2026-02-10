@@ -9,7 +9,7 @@ import {
   state,
   updateOfficeSnapshot,
 } from "./state";
-import type { ApiDuty, Role, RpcResult } from "./types";
+import type { ApiDuty, Provider, Role, RpcResult } from "./types";
 import { safeJson, toErrorMessage } from "./utils";
 
 const DEFAULT_DUTY_ROLE_POLICY: Record<ApiDuty, Role[]> = {
@@ -22,6 +22,22 @@ const DEFAULT_DUTY_ROLE_POLICY: Record<ApiDuty, Role[]> = {
   architect: ["synthesizer", "arbiter", "proposer"],
   reviewer: ["critic", "verifier", "arbiter"],
 };
+
+const GUIDE_REQUIRED_DUTIES: ApiDuty[] = [
+  "developer",
+  "frontend",
+  "tester",
+  "product_manager",
+  "mathematician",
+];
+
+const GUIDE_FALLBACK_ROLES: Role[] = [
+  "critic",
+  "researcher",
+  "synthesizer",
+  "verifier",
+  "arbiter",
+];
 
 export type ActionResult = {
   ok: boolean;
@@ -69,18 +85,121 @@ function getActiveGlobalApi(): import("./types").GlobalApiConfig | undefined {
   return state.globalApis[state.activeGlobalApiIndex] ?? state.globalApis[0];
 }
 
+function providerLabel(provider: Provider): string {
+  return provider === "openai"
+    ? "OpenAI"
+    : provider === "openai_compatible"
+    ? "OpenAI Compatible"
+    : provider === "anthropic"
+    ? "Anthropic"
+    : provider === "google"
+    ? "Google"
+    : "DeepSeek";
+}
+
+function roleLabel(role: Role): string {
+  return role === "proposer"
+    ? "Proposer"
+    : role === "critic"
+    ? "Critic"
+    : role === "researcher"
+    ? "Researcher"
+    : role === "verifier"
+    ? "Verifier"
+    : role === "synthesizer"
+    ? "Synthesizer"
+    : "Arbiter";
+}
+
+function dutyLabel(duty: ApiDuty): string {
+  return duty === "developer"
+    ? "工程师"
+    : duty === "frontend"
+    ? "前端工程师"
+    : duty === "tester"
+    ? "测试工程师"
+    : duty === "product_manager"
+    ? "产品经理"
+    : duty === "mathematician"
+    ? "数学家"
+    : duty === "researcher"
+    ? "研究员"
+    : duty === "architect"
+    ? "架构师"
+    : "审查者";
+}
+
+function buildGuideStaffingSnapshotText(): string {
+  const readyApis = state.globalApis
+    .map((api, index) => {
+      const modelId = api.modelId.trim();
+      const apiKey = api.apiKey.trim() || state.apiKeys[api.provider].trim();
+      if (!modelId || !apiKey) {
+        return undefined;
+      }
+
+      return {
+        index,
+        name: api.name.trim() || `API ${index + 1}`,
+        duty: asApiDuty(api.duty as string),
+        provider: api.provider,
+        modelId,
+      };
+    })
+    .filter((item): item is NonNullable<typeof item> => item !== undefined);
+
+  if (readyApis.length === 0) {
+    return [
+      "[API Staffing Snapshot]",
+      "No ready API found (missing model id or key). Ask user to add API config first.",
+    ].join("\n");
+  }
+
+  const providerSet = new Set(readyApis.map((api) => api.provider));
+  const dutySet = new Set(readyApis.map((api) => api.duty));
+  const missingDuties = GUIDE_REQUIRED_DUTIES.filter((duty) => !dutySet.has(duty));
+
+  const lines = [
+    "[API Staffing Snapshot]",
+    ...readyApis.map(
+      (api, idx) =>
+        `${idx + 1}. ${api.name} | duty=${dutyLabel(api.duty)} | provider=${providerLabel(api.provider)} | model=${api.modelId}`,
+    ),
+    `ready_api_count=${readyApis.length}`,
+    `provider_count=${providerSet.size}`,
+    `missing_required_duties=${missingDuties.length > 0 ? missingDuties.map((duty) => dutyLabel(duty)).join(", ") : "none"}`,
+  ];
+
+  if (providerSet.size <= 1 && readyApis.length >= 2) {
+    lines.push(
+      "provider_diversity_warning=all APIs are from one vendor; ask user whether to add cross-vendor APIs for independent thinking.",
+    );
+  }
+
+  return lines.join("\n");
+}
+
 function buildSecretaryCollaborationInstruction(secretaryCanFinalize: boolean): string {
+  const staffingSnapshot = buildGuideStaffingSnapshotText();
+
   const finalizeRule = secretaryCanFinalize
-    ? "4) The secretary may finalize on behalf of the user only when explicit authorization is already provided in this session; if authorization is missing or ambiguous, ask for confirmation first."
-    : "4) The secretary must not make final decisions; always hand over a clear confirmation checkpoint to the user before finalizing.";
+    ? "7) The secretary may finalize on behalf of the user only when explicit authorization is already provided in this session; if authorization is missing or ambiguous, ask for confirmation first."
+    : "7) The secretary must not make final decisions; always hand over a clear confirmation checkpoint to the user before finalizing.";
 
   return [
     "[Secretary Collaboration Mode]",
     "The leader acts as the user's Chief of Staff (secretary), not a unilateral decision maker.",
-    "1) First restate the user's goal and constraints before proposing details.",
-    "2) Do not jump to a final answer immediately; require at least one round of cross-review from other participants (feasibility, risk, missing details).",
-    "3) After synthesizing options, provide a concrete confirmation checkpoint for the user.",
+    "0) Start each new planning dialogue with: '总，今天想做什么？'.",
+    "1) Restate the goal and constraints, then assign each available API a concrete persona and responsibility.",
+    "2) Force multi-role collaboration: engineering, frontend, testing, math/algorithm, and product decision review.",
+    "3) Produce a concrete plan with sections: architecture(frontend/backend/info flow), milestones, workflow steps, risks, and acceptance criteria.",
+    "4) Do not jump to final answer immediately; require at least one visible cross-review round from other participants (feasibility/risk/missing details).",
+    "5) If staffing is insufficient (too few APIs, missing required duties, or poor provider diversity), explicitly ask user to add/reconfigure APIs before finalizing.",
+    "6) Prefer cross-vendor pairing for key roles to avoid tunnel vision (e.g., frontend/tester/math from different providers when possible).",
     finalizeRule,
+    "8) Before execution, ask user for final approval on workflow unless already authorized.",
+    "9) Always output 'Team Roster' and 'Execution Workflow' in a structured way.",
+    staffingSnapshot,
   ].join("\n");
 }
 
@@ -117,6 +236,26 @@ function roleForDuty(duty: ApiDuty): Role {
   return rolePriorityForDuty(duty)[0] ?? "proposer";
 }
 
+function pickBalancedGuideRole(
+  duty: ApiDuty,
+  roleCounts: Partial<Record<Role, number>>,
+): Role {
+  const preferred = rolePriorityForDuty(duty).filter((role) => role !== "proposer");
+  const rolePool = preferred.length > 0 ? preferred : GUIDE_FALLBACK_ROLES;
+
+  let chosen = rolePool[0] ?? "critic";
+  let minCount = Number.MAX_SAFE_INTEGER;
+  for (const role of rolePool) {
+    const count = roleCounts[role] ?? 0;
+    if (count < minCount) {
+      minCount = count;
+      chosen = role;
+    }
+  }
+
+  return chosen;
+}
+
 function buildGuideParticipantsFromGlobal(): Array<Record<string, unknown>> {
   if (state.globalApis.length === 0) {
     pushLog("[guide] buildGuideParticipantsFromGlobal: no global API config");
@@ -124,6 +263,7 @@ function buildGuideParticipantsFromGlobal(): Array<Record<string, unknown>> {
   }
 
   const participants: Array<Record<string, unknown>> = [];
+  const roleCounts: Partial<Record<Role, number>> = {};
   let leaderSet = false;
 
   const secretaryIndex =
@@ -151,7 +291,7 @@ function buildGuideParticipantsFromGlobal(): Array<Record<string, unknown>> {
     const role =
       index === secretaryIndex
         ? "proposer"
-        : roleForDuty(duty);
+        : pickBalancedGuideRole(duty, roleCounts);
 
     if (!apiKey) {
       pushLog(`[guide] skip api index=${index}: missing api key for provider=${provider}`);
@@ -167,6 +307,8 @@ function buildGuideParticipantsFromGlobal(): Array<Record<string, unknown>> {
       api_key: apiKey || undefined,
     });
 
+    roleCounts[role] = (roleCounts[role] ?? 0) + 1;
+
     const participantId = `guide-${role}-${index + 1}`;
 
     if (!leaderSet && index === secretaryIndex) {
@@ -177,30 +319,12 @@ function buildGuideParticipantsFromGlobal(): Array<Record<string, unknown>> {
       leaderSet = true;
     }
 
-    const providerLabel =
-      provider === "openai"
-        ? "OpenAI"
-        : provider === "openai_compatible"
-        ? "OpenAI Compatible"
-        : provider === "anthropic"
-        ? "Anthropic"
-        : provider === "google"
-        ? "Google"
-        : "DeepSeek";
-    const roleLabel =
-      role === "proposer"
-        ? "Proposer"
-        : role === "critic"
-        ? "Critic"
-        : role === "researcher"
-        ? "Researcher"
-        : role === "verifier"
-        ? "Verifier"
-        : role;
+    const currentProviderLabel = providerLabel(provider);
+    const currentRoleLabel = roleLabel(role);
     guideFlow.participantLabels[participantId] =
       index === secretaryIndex
-        ? `秘书（你的分身） · ${providerLabel}/${modelId}`
-        : `${api.name.trim() || roleLabel}（${roleLabel}） · ${providerLabel}/${modelId}`;
+        ? `秘书（你的分身） · ${currentProviderLabel}/${modelId}`
+        : `${api.name.trim() || currentRoleLabel}（${currentRoleLabel}） · ${currentProviderLabel}/${modelId}`;
 
     pushLog(
       `[guide] participant#${index + 1}: role=${role}, provider=${provider}, model=${modelId}, endpoint=${endpoint || "(default)"}, hasKey=${apiKey.length > 0}`,
